@@ -512,6 +512,20 @@ async def _artifact_add_sources(client, nb_id: str, urls: list, timeout: int) ->
     return scoped_ids
 
 
+async def _artifact_add_text(client, nb_id: str, title: str, content: str,
+                             timeout: int) -> list:
+    """Paste article text as the source — works for localhost/private sites
+    and pages behind bot protection where add_url would silently fail."""
+    try:
+        src = await client.sources.add_text(nb_id, title[:250], content,
+                                            wait=True,
+                                            wait_timeout=min(120, timeout))
+        sid = getattr(src, "id", None) or getattr(src, "source_id", None)
+        return [str(sid)] if sid else []
+    except Exception:
+        return []
+
+
 def _artifact_task_id(status) -> str | None:
     return (getattr(status, "task_id", None) or getattr(status, "id", None)
             or getattr(status, "artifact_id", None))
@@ -521,7 +535,9 @@ def _artifact_task_id(status) -> str | None:
 async def artifact_start(request: Request):
     """Kick off artifact generation and return immediately with task ids.
     {"kind": "audio"|"quiz"|"both", "urls": [permalink...], "profile": str,
-     "lang": "vi", "audio_format": "brief|deep_dive|critique|debate",
+     "title": str, "content": str (article text — preferred source, works for
+     private/localhost URLs), "lang": "vi",
+     "audio_format": "brief|deep_dive|critique|debate",
      "audio_length": "short|default|long",
      "quiz_quantity": "fewer|standard|more",
      "quiz_difficulty": "easy|medium|hard"}"""
@@ -539,8 +555,11 @@ async def artifact_start(request: Request):
         return _err(400, "bad_request", "kind must be audio|quiz|both")
     urls = [str(u) for u in (body.get("urls") or [])
             if isinstance(u, str) and u.strip()][:MAX_URLS]
-    if not urls:
-        return _err(400, "bad_request", "urls is required (post permalink)")
+    content = str(body.get("content") or "")[:200000]
+    title = str(body.get("title") or "ai-seo source")
+    if not urls and not content.strip():
+        return _err(400, "bad_request",
+                    "urls or content is required (article permalink/text)")
     profile = str(body.get("profile") or "p1")
     lang = str(body.get("lang") or "en")
     timeout = max(30, min(600, int(body.get("timeout") or DEFAULT_TIMEOUT)))
@@ -556,8 +575,13 @@ async def artifact_start(request: Request):
         try:
             async with client:
                 nb_id = await _artifact_notebook(client, profile)
-                scoped_ids = await _artifact_add_sources(
-                    client, nb_id, urls, timeout)
+                scoped_ids = []
+                if content.strip():
+                    scoped_ids += await _artifact_add_text(
+                        client, nb_id, title, content, timeout)
+                if urls:
+                    scoped_ids += await _artifact_add_sources(
+                        client, nb_id, urls, timeout)
                 src = scoped_ids or None
                 if "audio" in kinds:
                     from notebooklm import AudioFormat, AudioLength
