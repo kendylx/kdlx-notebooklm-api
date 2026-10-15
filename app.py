@@ -539,6 +539,8 @@ async def artifact_start(request: Request):
      private/localhost URLs), "lang": "vi",
      "audio_format": "brief|deep_dive|critique|debate",
      "audio_length": "short|default|long",
+     "audio_instructions": str (Audio Overview "customize" prompt — steers
+      style/tone consistently across posts),
      "quiz_quantity": "fewer|standard|more",
      "quiz_difficulty": "easy|medium|hard"}"""
     if not _authed(request):
@@ -596,9 +598,12 @@ async def artifact_start(request: Request):
                                       AudioFormat.BRIEF)
                     length = len_map.get(str(body.get("audio_length") or "short").lower(),
                                          AudioLength.SHORT)
+                    instructions = str(
+                        body.get("audio_instructions") or "").strip()[:4000] or None
                     st = await client.artifacts.generate_audio(
                         nb_id, source_ids=src, audio_format=fmt,
-                        audio_length=length, language=lang)
+                        audio_length=length, language=lang,
+                        instructions=instructions)
                     tid = _artifact_task_id(st)
                     if tid:
                         tasks["audio"] = tid
