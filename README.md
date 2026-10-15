@@ -79,8 +79,8 @@ git clone https://github.com/kendylx/kdlx-notebooklm-api.git
 cd kdlx-notebooklm-api
 cp .env.example .env            # sửa NLM_BRIDGE_TOKEN
 
-# Đổi sang named volume (server không login trực tiếp được):
-docker compose -f compose.yml -f compose.portainer.yml up -d --build
+# File portainer là file ĐỘC LẬP (đã gồm build: . + named volume):
+docker compose -f compose.portainer.yml up -d --build
 ```
 
 Đẩy session từ máy local lên VPS:
@@ -105,13 +105,20 @@ bridge.domain.com {
 
 ## 3. Deploy Portainer
 
-1. **Stacks → Add stack** → đặt tên `nlm-bridge`
-2. Chọn **Repository**: URL repo này, compose path `compose.portainer.yml` — hoặc **Web editor** paste nội dung `compose.portainer.yml` (kèm phần `build:` nếu dùng repo mode)
-3. Thêm **Environment variable**: `NLM_BRIDGE_TOKEN=<token thật>`
-4. **Deploy the stack** → Portainer build image và chạy (named volume `nlm-data` tự tạo)
+> ⚠️ **Không dùng Web editor** — web editor không có build context nên `build: .` sẽ báo
+> *"service has neither an image nor a build context"*. Bắt buộc dùng **Repository** mode.
+
+1. **Stacks → Add stack** → đặt tên `nlm-bridge` → chọn build method **Repository**
+2. Điền:
+   - **Repository URL**: `https://github.com/kendylx/kdlx-notebooklm-api`
+   - **Repository reference**: `refs/heads/main`
+   - **Compose path**: `compose.portainer.yml`
+   - Repo đang **private** → bật **Authentication**: username GitHub + Personal Access Token scope `repo` ([tạo tại đây](https://github.com/settings/tokens))
+3. Thêm **Environment variable**: `NLM_BRIDGE_TOKEN` = `<token thật>`
+4. **Deploy the stack** → Portainer clone repo → build image → chạy (named volume `nlm-data` tự tạo)
 5. Đẩy session từ máy local bằng `push-profile.sh` hoặc `POST /auth` như mục VPS
 
-> Với mode Web editor không có `build:` context: thay `build: .` bằng image đã push lên registry, hoặc clone repo về server rồi dùng Repository mode.
+**Update sau này**: vào stack → **Pull and redeploy** (kéo commit mới + rebuild), hoặc bật **Re-pull image / GitOps updates**.
 
 ## Nhiều tài khoản Google (profile)
 

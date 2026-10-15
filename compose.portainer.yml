@@ -1,16 +1,29 @@
-# Portainer / VPS variant — named volume thay bind-mount.
+# Portainer / VPS variant — file ĐỘC LẬP, named volume thay bind-mount.
 #
-# Dùng: Portainer → Stacks → Add stack → paste nội dung file này
-# (hoặc docker compose -f compose.yml -f compose.portainer.yml up -d)
+# Cách dùng:
+#   • Portainer → Stacks → Add stack → Repository:
+#       Repository URL : https://github.com/kendylx/kdlx-notebooklm-api
+#       Compose path   : compose.portainer.yml
+#       (repo private → bật Authentication, dùng GitHub username + PAT scope repo)
+#   • CLI trên VPS (đã clone repo):
+#       docker compose -f compose.portainer.yml up -d --build
 #
-# Trên VPS không login browser được → session đẩy từ máy local qua:
+# KHÔNG paste file này vào Web editor — web editor không có build context.
+#
+# Session đẩy từ máy local qua:
 #   NLM_BRIDGE_URL=https://bridge.domain.com NLM_BRIDGE_TOKEN=<token> ./push-profile.sh p1
 # Nhớ expose port 8767 hoặc đặt sau reverse proxy (Nginx Proxy Manager…).
 services:
   nlm-bridge:
+    build: .
+    container_name: nlm-bridge
+    restart: unless-stopped
+    ports:
+      - "8767:8767"
     environment:
       NLM_BRIDGE_TOKEN: "${NLM_BRIDGE_TOKEN:-change-me}"
       NLM_STORAGE_DIR: /data/profiles
+      # NLM_MOCK: "1"
     volumes:
       - nlm-data:/data
 volumes:
