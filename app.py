@@ -246,7 +246,9 @@ async def _real_research(keyword: str, urls: list, profile: str, mode: str,
                         deadline = time.monotonic() + timeout
                         while task_id and time.monotonic() < deadline:
                             st = await client.research.poll(nb_id)
-                            if isinstance(st, dict) and st.get("status") in ("completed", "done"):
+                            st_state = (str(st.get("status") or "").lower()
+                                        if isinstance(st, dict) else "")
+                            if st_state in ("completed", "done"):
                                 imported = await client.research.import_sources(
                                     nb_id, task_id, st.get("sources", []))
                                 if isinstance(imported, list):
@@ -255,6 +257,11 @@ async def _real_research(keyword: str, urls: list, profile: str, mode: str,
                                             sid = it.get("source_id") or it.get("id")
                                             if sid:
                                                 scoped_ids.append(str(sid))
+                                break
+                            # Terminal-but-not-completed states must stop the
+                            # loop — polling a dead task burns the whole budget.
+                            if st_state in ("failed", "error", "cancelled",
+                                            "canceled"):
                                 break
                             await asyncio.sleep(5)
                 except Exception:
