@@ -728,11 +728,12 @@ async def artifact_download(request: Request):
 
 
 # --------------------------------------------------------------------------
-# /serp — thin proxy to the external AIBG serp service. The plugin points
-# its "aibg" search backend at this endpoint and sends the usual payload
-# {query,model,lang,country,count,exclude_domains}; we forward it verbatim
-# to NLM_AIBG_URL (Bearer = NLM_AIBG_KEY, `|`/`,` pool rotated round-robin)
-# and normalize the upstream reply into the shape AIBGSerpSearch reads:
+# /serp — adapter in front of the external AIBG/9r search service. The
+# plugin posts its "aibg" payload {query,model,lang,country,count,
+# exclude_domains}; we translate it to the upstream contract
+# {model,query,search_type:"web",max_results} (Bearer = NLM_AIBG_KEY,
+# `|`/`,` pool rotated round-robin) and normalize the reply into the shape
+# AIBGSerpSearch reads:
 # {results:[{position,url,title,snippet}], paa:[str], related:[str]}.
 # This makes a localhost-only AIBG instance reachable from hosted WP.
 # --------------------------------------------------------------------------
@@ -760,30 +761,41 @@ def _host_of(url: str) -> str:
 
 
 def _serp_normalize(data: dict, excluded: set) -> dict:
-    raw_results = data.get("results") or data.get("organic") or []
+    # Tolerant mapping: unwrap common containers, accept the field names
+    # seen across serper/scrappa/9r-style payloads.
+    for wrap in ("data", "result", "response", "payload"):
+        if isinstance(data.get(wrap), dict):
+            data = data[wrap]
+            break
+    raw_results = (data.get("results") or data.get("organic")
+                   or data.get("organic_results") or data.get("items")
+                   or data.get("web") or [])
     results = []
     for i, it in enumerate(raw_results):
         if not isinstance(it, dict):
             continue
-        link = str(it.get("url") or it.get("link") or "")
+        link = str(it.get("url") or it.get("link") or it.get("href") or "")
         if _host_of(link) in excluded:
             continue
-        pos = it.get("position")
+        pos = it.get("position") or it.get("rank")
         results.append({
             "position": int(pos) if isinstance(pos, (int, float))
                         or (isinstance(pos, str) and pos.isdigit()) else i + 1,
             "url": link,
-            "title": str(it.get("title") or ""),
-            "snippet": str(it.get("snippet") or it.get("description") or ""),
+            "title": str(it.get("title") or it.get("name") or ""),
+            "snippet": str(it.get("snippet") or it.get("description")
+                           or it.get("content") or it.get("text") or ""),
         })
     paa = []
-    for x in (data.get("paa") or data.get("peopleAlsoAsk") or []):
+    for x in (data.get("paa") or data.get("peopleAlsoAsk")
+              or data.get("related_questions") or []):
         if isinstance(x, str) and x.strip():
             paa.append(x.strip())
         elif isinstance(x, dict) and x.get("question"):
             paa.append(str(x["question"]))
     related = []
-    for x in (data.get("related") or data.get("relatedSearches") or []):
+    for x in (data.get("related") or data.get("relatedSearches")
+              or data.get("related_searches") or []):
         if isinstance(x, str) and x.strip():
             related.append(x.strip())
         elif isinstance(x, dict) and x.get("query"):
@@ -823,15 +835,13 @@ async def serp(request: Request):
                 "_meta": {"model": "mock-serp"}}
 
     import httpx
+    # Upstream contract: {model, query, search_type:"web", max_results}
     fwd = {
-        "query": query,
         "model": str(body.get("model") or ""),
-        "lang": lang,
-        "country": country,
-        "count": count,
+        "query": query,
+        "search_type": "web",
+        "max_results": count,
     }
-    if excluded:
-        fwd["exclude_domains"] = sorted(excluded)
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     aibg_key = _next_aibg_key()
     if aibg_key:
@@ -842,13 +852,22 @@ async def serp(request: Request):
     except Exception as e:
         return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
     if not 200 <= r.status_code < 300:
-        return _err(502, "upstream_error", f"aibg HTTP {r.status_code}")
+        detail = r.text[:300].strip()
+        return _err(502, "upstream_error",
+                    f"aibg HTTP {r.status_code}"
+                    + (f": {detail}" if detail else ""))
     try:
         data = r.json()
     except Exception:
         return _err(502, "upstream_error", "aibg response not JSON")
     if not isinstance(data, dict):
         return _err(502, "upstream_error", "aibg response not JSON object")
+    # Some gateways return HTTP 200 with an {"error": ...} body.
+    if data.get("error") and not (data.get("results") or data.get("data")):
+        return _err(502, "upstream_error",
+                    f"aibg: {str(data['error'])[:300]}")
     out = _serp_normalize(data, excluded)
-    out["_meta"] = {"provider": "aibg", "model": fwd["model"]}
+    out["_meta"] = {"provider": "aibg",
+                    "model": fwd["model"],
+                    "upstream": data.get("provider") or data.get("engine")}
     return out
