@@ -37,29 +37,38 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `POST /artifact` | `{"kind": "audio"|"quiz"|"both", "urls": [permalink], "profile", "lang", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard}` → `{"tasks": {"audio": "<task_id>"}}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
 | `GET /artifact/download?task_id=&kind=audio|quiz&profile=` | Audio → file MP3. Quiz → `{"status":"success","quiz":[…]}` |
-| `POST /serp` | SERP tự host (Serper.dev) — cùng contract với backend `aibg` của plugin |
+| `POST /serp` | Proxy tới AIBG serp service bên ngoài — trả đúng shape plugin đọc |
 
 Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL bạn truyền vào.
 
-### `/serp` — SERP tự host cho plugin
+### `/serp` — bọc AIBG service cho plugin trên hosting
 
-Cùng contract với backend `aibg` trong Settings → Search API, nên có thể trỏ
-endpoint `…/serp` thẳng vào bridge này thay vì chạy một bridge SERP riêng:
+AIBG service thường chỉ chạy localhost (`127.0.0.1:8766`) nên plugin trên
+hosting không với tới được. Bridge này đặt trên VPS làm **proxy**: plugin
+trỏ `search_aibg_endpoint` vào `http://<vps>:8767/serp`, bridge forward
+payload nguyên văn tới AIBG thật rồi normalize response về đúng shape
+`{results, paa, related}` mà plugin đọc. Key của AIBG giữ server-side —
+plugin chỉ cần `NLM_BRIDGE_TOKEN`.
 
 ```
 POST /serp        Authorization: Bearer <NLM_BRIDGE_TOKEN>
-{"query": "cách tắm cho chim cảnh", "lang": "vi", "country": "vn",
- "count": 10, "exclude_domains": ["my-site.com"]}
+{"query": "cách tắm cho chim cảnh", "model": "serp-default",
+ "lang": "vi", "country": "vn", "count": 10,
+ "exclude_domains": ["my-site.com"]}
 → {"results": [{"position","url","title","snippet"}],
-   "paa": ["câu hỏi…"], "related": ["truy vấn…"], "_meta": {"model": "serper.dev"}}
+   "paa": ["câu hỏi…"], "related": ["truy vấn…"],
+   "_meta": {"provider": "aibg", "model": "…"}}
 ```
 
-- Bật bằng env `NLM_SERPER_KEY` (key Serper.dev — lấy tại serper.dev, free tier
-  2.500 query). Không set → endpoint trả `501 not_configured`.
-- `exclude_domains` lọc theo host đích (vd: loại chính site mình khỏi SERP).
-- Trong plugin: Settings → Search API → backend `aibg`, endpoint
-  `http://<ip>:8767/serp`, API Key = `NLM_BRIDGE_TOKEN`. Vẫn nên giữ
-  Serper/Scrappa trực tiếp làm fallback trong `search_priority`.
+| Env | Vai trò |
+|---|---|
+| `NLM_AIBG_URL` | Endpoint của AIBG service (vd `http://<9router>:8766/serp`). Payload `{query, model, lang, country, count, exclude_domains}` được forward nguyên văn |
+| `NLM_AIBG_KEY` | Bearer key cho AIBG service; nhiều key cách nhau bằng `\|` hoặc `,` → xoay vòng |
+
+- `NLM_AIBG_URL` trống → `501 not_configured`; upstream chết → `502` kèm mã HTTP.
+- `exclude_domains` vừa forward lên AIBG vừa lọc lại phía bridge (2 lớp).
+- Serper/Scrappa **không** cần trong bridge — plugin đã có client trực tiếp;
+  giữ chúng trong `search_priority` làm fallback khi `/serp` lỗi.
 
 ---
 
