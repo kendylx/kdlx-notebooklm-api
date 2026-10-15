@@ -37,8 +37,29 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `POST /artifact` | `{"kind": "audio"|"quiz"|"both", "urls": [permalink], "profile", "lang", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard}` → `{"tasks": {"audio": "<task_id>"}}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
 | `GET /artifact/download?task_id=&kind=audio|quiz&profile=` | Audio → file MP3. Quiz → `{"status":"success","quiz":[…]}` |
+| `POST /serp` | SERP tự host (Serper.dev) — cùng contract với backend `aibg` của plugin |
 
 Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL bạn truyền vào.
+
+### `/serp` — SERP tự host cho plugin
+
+Cùng contract với backend `aibg` trong Settings → Search API, nên có thể trỏ
+endpoint `…/serp` thẳng vào bridge này thay vì chạy một bridge SERP riêng:
+
+```
+POST /serp        Authorization: Bearer <NLM_BRIDGE_TOKEN>
+{"query": "cách tắm cho chim cảnh", "lang": "vi", "country": "vn",
+ "count": 10, "exclude_domains": ["my-site.com"]}
+→ {"results": [{"position","url","title","snippet"}],
+   "paa": ["câu hỏi…"], "related": ["truy vấn…"], "_meta": {"model": "serper.dev"}}
+```
+
+- Bật bằng env `NLM_SERPER_KEY` (key Serper.dev — lấy tại serper.dev, free tier
+  2.500 query). Không set → endpoint trả `501 not_configured`.
+- `exclude_domains` lọc theo host đích (vd: loại chính site mình khỏi SERP).
+- Trong plugin: Settings → Search API → backend `aibg`, endpoint
+  `http://<ip>:8767/serp`, API Key = `NLM_BRIDGE_TOKEN`. Vẫn nên giữ
+  Serper/Scrappa trực tiếp làm fallback trong `search_priority`.
 
 ---
 

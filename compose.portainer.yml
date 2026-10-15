@@ -23,6 +23,7 @@ services:
     environment:
       NLM_BRIDGE_TOKEN: "${NLM_BRIDGE_TOKEN:-change-me}"
       NLM_STORAGE_DIR: /data/profiles
+      NLM_SERPER_KEY: "${NLM_SERPER_KEY:-}"
       # NLM_MOCK: "1"
     volumes:
       - nlm-data:/data

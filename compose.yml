@@ -9,6 +9,8 @@ services:
       # ĐỔI thành chuỗi bí mật của bạn — phải khớp "API Key" trong Settings → Search API
       NLM_BRIDGE_TOKEN: "${NLM_BRIDGE_TOKEN:-test-secret-token}"
       NLM_STORAGE_DIR: /data/profiles
+      # Serper.dev key bật endpoint /serp (SERP tự host cho plugin)
+      NLM_SERPER_KEY: "${NLM_SERPER_KEY:-}"
       # Bỏ comment dòng dưới để chạy mock (test contract, không cần Google login)
       # NLM_MOCK: "1"
     volumes:

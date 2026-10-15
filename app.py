@@ -725,3 +725,79 @@ async def artifact_download(request: Request):
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
             return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+
+
+# --------------------------------------------------------------------------
+# /serp — self-hosted SERP endpoint with the same contract the plugin's
+# AIBG backend expects: POST {query,model,lang,country,count,exclude_domains}
+# -> {results:[{position,url,title,snippet}], paa:[], related:[]}.
+# Backed by Serper.dev — set NLM_SERPER_KEY in the environment.
+# --------------------------------------------------------------------------
+
+SERPER_KEY = os.environ.get("NLM_SERPER_KEY", "").strip()
+SERPER_ENDPOINT = "https://google.serper.dev/search"
+
+
+@app.post("/serp")
+async def serp(request: Request):
+    if not _authed(request):
+        return _err(401, "unauthorized", "invalid bearer token")
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "bad_json", "request body must be a JSON object")
+    if not isinstance(body, dict):
+        return _err(400, "bad_json", "request body must be a JSON object")
+    query = str(body.get("query") or "").strip()
+    if not query:
+        return _err(400, "bad_request", "query is required")
+    if not SERPER_KEY:
+        return _err(501, "not_configured",
+                    "NLM_SERPER_KEY is not set on this bridge")
+    lang = str(body.get("lang") or "vi")[:10]
+    country = str(body.get("country") or "vn").lower()[:10]
+    count = max(1, min(30, int(body.get("count") or 10)))
+    excluded = {str(d).lower().lstrip("www.")
+                for d in (body.get("exclude_domains") or []) if isinstance(d, str)}
+
+    if MOCK:
+        return {"results": [{"position": 1, "url": "https://example.com",
+                             "title": "mock", "snippet": "mock snippet"}],
+                "paa": ["mock paa"], "related": ["mock related"],
+                "_meta": {"model": "mock-serp"}}
+
+    import httpx
+    payload = {"q": query, "gl": country, "hl": lang, "num": count}
+    try:
+        async with httpx.AsyncClient(timeout=30) as http:
+            r = await http.post(SERPER_ENDPOINT, json=payload,
+                                headers={"X-API-KEY": SERPER_KEY})
+    except Exception as e:
+        return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+    if r.status_code != 200:
+        return _err(502, "upstream_error", f"serper HTTP {r.status_code}")
+    try:
+        data = r.json()
+    except Exception:
+        return _err(502, "upstream_error", "serper response not JSON")
+
+    results = []
+    excluded_hosts = excluded
+    for i, it in enumerate(data.get("organic") or []):
+        link = str(it.get("link") or "")
+        host = re.sub(r"^www\.", "",
+                      re.sub(r"^https?://", "", link).split("/")[0]).lower()
+        if host and host in excluded_hosts:
+            continue
+        results.append({
+            "position": int(it.get("position") or i + 1),
+            "url": link,
+            "title": str(it.get("title") or ""),
+            "snippet": str(it.get("snippet") or ""),
+        })
+    paa = [str(x.get("question")) for x in (data.get("peopleAlsoAsk") or [])
+           if isinstance(x, dict) and x.get("question")]
+    related = [str(x.get("query")) for x in (data.get("relatedSearches") or [])
+               if isinstance(x, dict) and x.get("query")]
+    return {"results": results, "paa": paa, "related": related,
+            "_meta": {"model": "serper.dev"}}
