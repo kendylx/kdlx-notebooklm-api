@@ -635,8 +635,18 @@ async def artifact_start(request: Request):
                                     QuizQuantity.STANDARD)
                     diff = d_map.get(str(body.get("quiz_difficulty") or "medium").lower(),
                                      QuizDifficulty.MEDIUM)
+                    # generate_quiz has no language param — language and any
+                    # custom style both travel through `instructions`.
+                    q_instructions = str(
+                        body.get("quiz_instructions") or "").strip()[:4000]
+                    if lang and not lang.lower().startswith("en"):
+                        lang_dir = (f"Write every question, option, and "
+                                    f"explanation entirely in {lang}.")
+                        q_instructions = (f"{lang_dir} {q_instructions}").strip()
                     st = await client.artifacts.generate_quiz(
-                        nb_id, source_ids=src, quantity=qty, difficulty=diff)
+                        nb_id, source_ids=src,
+                        instructions=q_instructions or None,
+                        quantity=qty, difficulty=diff)
                     tid = _artifact_task_id(st)
                     st_state = str(getattr(st, "status", "") or "").lower()
                     if tid and "fail" in st_state:
