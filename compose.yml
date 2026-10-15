@@ -1,0 +1,21 @@
+services:
+  nlm-bridge:
+    build: .
+    container_name: nlm-bridge
+    restart: unless-stopped
+    ports:
+      - "8767:8767"
+    environment:
+      # ĐỔI thành chuỗi bí mật của bạn — phải khớp "API Key" trong Settings → Search API
+      NLM_BRIDGE_TOKEN: "${NLM_BRIDGE_TOKEN:-test-secret-token}"
+      NLM_STORAGE_DIR: /data/profiles
+      # Bỏ comment dòng dưới để chạy mock (test contract, không cần Google login)
+      # NLM_MOCK: "1"
+    volumes:
+      # Bind-mount thẳng thư mục profiles của `notebooklm login` trên host —
+      # login trên host là container thấy ngay, không cần bước upload.
+      # Khi deploy lên server khác (không login trực tiếp được), đổi sang
+      # named volume `- nlm-data:/data` và push session qua POST /auth.
+      - ${NLM_HOST_DIR:-$HOME/.notebooklm}:/data
+volumes:
+  nlm-data:

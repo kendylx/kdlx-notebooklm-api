@@ -1,0 +1,17 @@
+# Portainer / VPS variant — named volume thay bind-mount.
+#
+# Dùng: Portainer → Stacks → Add stack → paste nội dung file này
+# (hoặc docker compose -f compose.yml -f compose.portainer.yml up -d)
+#
+# Trên VPS không login browser được → session đẩy từ máy local qua:
+#   NLM_BRIDGE_URL=https://bridge.domain.com NLM_BRIDGE_TOKEN=<token> ./push-profile.sh p1
+# Nhớ expose port 8767 hoặc đặt sau reverse proxy (Nginx Proxy Manager…).
+services:
+  nlm-bridge:
+    environment:
+      NLM_BRIDGE_TOKEN: "${NLM_BRIDGE_TOKEN:-change-me}"
+      NLM_STORAGE_DIR: /data/profiles
+    volumes:
+      - nlm-data:/data
+volumes:
+  nlm-data:
