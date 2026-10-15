@@ -574,6 +574,7 @@ async def artifact_start(request: Request):
         from notebooklm import NotebookLMClient
         client = await NotebookLMClient.from_storage(_storage_path(profile))
         tasks: dict = {}
+        rejected: dict = {}
         try:
             async with client:
                 nb_id = await _artifact_notebook(client, profile)
@@ -605,7 +606,15 @@ async def artifact_start(request: Request):
                         audio_length=length, language=lang,
                         instructions=instructions)
                     tid = _artifact_task_id(st)
-                    if tid:
+                    st_state = str(getattr(st, "status", "") or "").lower()
+                    # A kickoff can return a task id whose generation is
+                    # already FAILED (e.g. quota) — do not queue a dead task.
+                    if tid and "fail" in st_state:
+                        rejected["audio"] = str(
+                            getattr(st, "error", None)
+                            or getattr(st, "error_code", None)
+                            or "generation rejected at kickoff")
+                    elif tid:
                         tasks["audio"] = tid
                 if "quiz" in kinds:
                     from notebooklm import QuizQuantity, QuizDifficulty
@@ -622,18 +631,24 @@ async def artifact_start(request: Request):
                     st = await client.artifacts.generate_quiz(
                         nb_id, source_ids=src, quantity=qty, difficulty=diff)
                     tid = _artifact_task_id(st)
-                    if tid:
+                    st_state = str(getattr(st, "status", "") or "").lower()
+                    if tid and "fail" in st_state:
+                        rejected["quiz"] = str(
+                            getattr(st, "error", None)
+                            or getattr(st, "error_code", None)
+                            or "generation rejected at kickoff")
+                    elif tid:
                         tasks["quiz"] = tid
         finally:
             try:
                 await client.close()
             except Exception:
                 pass
-        return tasks
+        return {"tasks": tasks, "rejected": rejected}
 
     async with _lock:
         try:
-            tasks = await asyncio.wait_for(_run(), timeout=timeout + 30)
+            result = await asyncio.wait_for(_run(), timeout=timeout + 30)
         except asyncio.TimeoutError:
             return _err(504, "timeout", "artifact start timed out")
         except FileNotFoundError:
@@ -641,9 +656,16 @@ async def artifact_start(request: Request):
                         "storage_state.json not found — run the login flow")
         except Exception as e:
             return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+    tasks = result["tasks"]
+    rejected = result["rejected"]
     if not tasks:
-        return _err(502, "upstream_error", "no artifact task accepted")
-    return {"status": "success", "profile": profile, "tasks": tasks}
+        detail = "; ".join(f"{k}: {v}" for k, v in rejected.items()) \
+            or "no artifact task accepted"
+        return _err(502, "upstream_error", detail)
+    resp = {"status": "success", "profile": profile, "tasks": tasks}
+    if rejected:
+        resp["rejected"] = rejected
+    return resp
 
 
 async def _artifact_status(client, nb_id: str, task_id: str) -> dict:
@@ -652,14 +674,24 @@ async def _artifact_status(client, nb_id: str, task_id: str) -> dict:
              or str(st)).lower()
     if "complete" in state or state in ("done", "finished", "succeeded"):
         state = "completed"
+    elif "not_found" in state or "notfound" in state or "missing" in state:
+        # Library reports NOT_FOUND when the artifact is absent from the
+        # studio listing — expected for seconds after kickoff, but if it
+        # persists the generation was silently rejected (quota). Never
+        # collapse it into "pending" or the caller polls a dead task.
+        state = "not_found"
     elif "fail" in state or "error" in state:
         state = "failed"
     elif "progress" in state or "running" in state:
         state = "in_progress"
     else:
         state = "pending"
-    return {"status": state,
-            "artifact_id": getattr(st, "artifact_id", None) or task_id}
+    out = {"status": state,
+           "artifact_id": getattr(st, "artifact_id", None) or task_id}
+    err = getattr(st, "error", None) or getattr(st, "error_code", None)
+    if err:
+        out["error"] = str(err)
+    return out
 
 
 @app.get("/artifact/status")
