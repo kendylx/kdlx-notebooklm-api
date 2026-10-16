@@ -500,12 +500,29 @@ async def research(request: Request):
 
 
 # --------------------------------------------------------------------------
-# Studio artifacts: Audio Overview + Quiz. Generation is slow (minutes), so
-# the flow is: POST /artifact -> task ids, GET /artifact/status -> poll,
+# Studio artifacts: Audio Overview + Quiz + Video Overview. Generation is
+# slow (minutes; video up to ~1h for cinematic), so the flow is:
+# POST /artifact -> task ids, GET /artifact/status -> poll,
 # GET /artifact/download -> file/json once completed.
 # --------------------------------------------------------------------------
 
-_ARTIFACT_KINDS = ("audio", "quiz")
+_ARTIFACT_KINDS = ("audio", "quiz", "video")
+
+
+def _parse_kinds(raw_kind: str) -> tuple | None:
+    """Accept "both" (audio+quiz, legacy), "all", or a comma/pipe list like
+    "audio,video" so callers opt into any subset explicitly."""
+    raw_kind = raw_kind.lower().strip()
+    if raw_kind == "both":
+        return ("audio", "quiz")
+    if raw_kind == "all":
+        return _ARTIFACT_KINDS
+    kinds = tuple(k for k in re.split(r"[,|]", raw_kind) if k)
+    if not kinds or any(k not in _ARTIFACT_KINDS for k in kinds):
+        return None
+    return kinds
+
+
 _ARTIFACT_DIR = Path(os.environ.get("NLM_ARTIFACT_DIR", "/tmp/nlm-artifacts"))
 
 
@@ -551,18 +568,110 @@ def _artifact_task_id(status) -> str | None:
             or getattr(status, "artifact_id", None))
 
 
+def _collect_task(tasks: dict, rejected: dict, kind: str, status) -> None:
+    """Record a generation kickoff: a task id whose initial state is already
+    FAILED (quota) is rejected now instead of being queued as a dead task."""
+    tid = _artifact_task_id(status)
+    if not tid:
+        return
+    st_state = str(getattr(status, "status", "") or "").lower()
+    if "fail" in st_state:
+        rejected[kind] = str(
+            getattr(status, "error", None)
+            or getattr(status, "error_code", None)
+            or "generation rejected at kickoff")
+    else:
+        tasks[kind] = tid
+
+
+_VIDEO_FORMATS = {
+    "explainer": "EXPLAINER", "brief": "BRIEF",
+    "cinematic": "CINEMATIC", "short": "SHORT",
+}
+_VIDEO_STYLES = {
+    "auto": "AUTO_SELECT", "custom": "CUSTOM", "classic": "CLASSIC",
+    "whiteboard": "WHITEBOARD", "kawaii": "KAWAII", "anime": "ANIME",
+    "watercolor": "WATERCOLOR", "retro_print": "RETRO_PRINT",
+    "heritage": "HERITAGE", "paper_craft": "PAPER_CRAFT",
+}
+
+
+async def _gen_video(client, nb_id: str, source_ids, lang: str,
+                     lang_name: str, body: dict,
+                     tasks: dict, rejected: dict) -> None:
+    """Video Overview — validates the same constraints the library's
+    normalize_video_prompt enforces, but reports them under `rejected` so a
+    bad video combo never sinks sibling artifact kickoffs."""
+    from notebooklm import VideoFormat, VideoStyle
+    fmt_name = str(body.get("video_format") or "explainer").lower()
+    style_name = str(body.get("video_style") or "auto").lower()
+    if fmt_name not in _VIDEO_FORMATS:
+        rejected["video"] = (
+            f"unknown video_format '{fmt_name}' "
+            f"(explainer|brief|cinematic|short)")
+        return
+    if style_name not in _VIDEO_STYLES:
+        rejected["video"] = (
+            f"unknown video_style '{style_name}' "
+            f"({'|'.join(_VIDEO_STYLES)})")
+        return
+    video_format = getattr(VideoFormat, _VIDEO_FORMATS[fmt_name])
+    video_style = getattr(VideoStyle, _VIDEO_STYLES[style_name])
+    style_prompt = str(body.get("video_style_prompt") or "").strip()[:4000]
+    # Mirror normalize_video_prompt in the library: cinematic rejects
+    # style_prompt; short has a fixed visual style (no style, no prompt);
+    # style_prompt only exists for video_style=custom.
+    if video_format == VideoFormat.CINEMATIC and style_prompt:
+        rejected["video"] = "video_style_prompt is not supported for cinematic videos"
+        return
+    if video_format == VideoFormat.SHORT:
+        if style_name not in ("auto",) or style_prompt:
+            rejected["video"] = (
+                "video_style/video_style_prompt are not supported for "
+                "short videos (fixed visual style)")
+            return
+        video_style = None
+    if video_style == VideoStyle.CUSTOM and not style_prompt:
+        rejected["video"] = "video_style_prompt is required when video_style=custom"
+        return
+    if style_prompt and video_style != VideoStyle.CUSTOM:
+        rejected["video"] = "video_style_prompt requires video_style=custom"
+        return
+    # Same contract as quiz: non-English output needs an explicit directive —
+    # for video it folds into `instructions` (the Studio "customize" field).
+    instructions = str(body.get("video_instructions") or "").strip()[:4000]
+    if lang and not lang.lower().startswith("en"):
+        lang_dir = (f"Produce the narration, on-screen text, and captions "
+                    f"entirely in {lang_name}.")
+        instructions = f"{lang_dir} {instructions}".strip()
+    st = await client.artifacts.generate_video(
+        nb_id, source_ids=source_ids, language=lang,
+        instructions=instructions or None,
+        video_format=video_format, video_style=video_style,
+        style_prompt=style_prompt or None)
+    _collect_task(tasks, rejected, "video", st)
+
+
 @app.post("/artifact")
 async def artifact_start(request: Request):
     """Kick off artifact generation and return immediately with task ids.
-    {"kind": "audio"|"quiz"|"both", "urls": [permalink...], "profile": str,
+    {"kind": "audio"|"quiz"|"video"|"both"|"all"|"audio,video" (comma/pipe
+      list or aliases: both=audio+quiz, all=every kind),
+     "urls": [permalink...], "profile": str,
      "title": str, "content": str (article text — preferred source, works for
-     private/localhost URLs), "lang": "vi",
+     private/localhost URLs), "lang": "vi", "lang_name": "Vietnamese",
      "audio_format": "brief|deep_dive|critique|debate",
      "audio_length": "short|default|long",
      "audio_instructions": str (Audio Overview "customize" prompt — steers
       style/tone consistently across posts),
      "quiz_quantity": "fewer|standard|more",
-     "quiz_difficulty": "easy|medium|hard"}"""
+     "quiz_difficulty": "easy|medium|hard",
+     "quiz_instructions": str,
+     "video_format": "explainer|brief|cinematic|short",
+     "video_style": "auto|classic|whiteboard|kawaii|anime|watercolor|
+      retro_print|heritage|paper_craft|custom",
+     "video_style_prompt": str (required when video_style=custom),
+     "video_instructions": str (Video Overview customize prompt)}"""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     try:
@@ -571,10 +680,10 @@ async def artifact_start(request: Request):
         return _err(400, "bad_json", "request body must be a JSON object")
     if not isinstance(body, dict):
         return _err(400, "bad_json", "request body must be a JSON object")
-    kind = str(body.get("kind") or "audio").lower()
-    kinds = _ARTIFACT_KINDS if kind == "both" else (kind,)
-    if any(k not in _ARTIFACT_KINDS for k in kinds):
-        return _err(400, "bad_request", "kind must be audio|quiz|both")
+    kinds = _parse_kinds(str(body.get("kind") or "audio"))
+    if kinds is None:
+        return _err(400, "bad_request",
+                    "kind must be audio|quiz|video|both|all or a comma list")
     urls = [str(u) for u in (body.get("urls") or [])
             if isinstance(u, str) and u.strip()][:MAX_URLS]
     content = str(body.get("content") or "")[:200000]
@@ -606,73 +715,75 @@ async def artifact_start(request: Request):
                     scoped_ids += await _artifact_add_sources(
                         client, nb_id, urls, timeout)
                 src = scoped_ids or None
+                lang_name = str(body.get("lang_name") or "").strip() or lang
+
+                # Per-kind isolation: a validation/quota error on one kind
+                # must not abort siblings whose tasks were already created
+                # upstream — record it under `rejected` instead of throwing.
                 if "audio" in kinds:
-                    from notebooklm import AudioFormat, AudioLength
-                    fmt_map = {"brief": AudioFormat.BRIEF,
-                               "deep_dive": AudioFormat.DEEP_DIVE,
-                               "critique": AudioFormat.CRITIQUE,
-                               "debate": AudioFormat.DEBATE}
-                    len_map = {"short": AudioLength.SHORT,
-                               "default": AudioLength.DEFAULT,
-                               "long": AudioLength.LONG}
-                    fmt = fmt_map.get(str(body.get("audio_format") or "brief").lower(),
-                                      AudioFormat.BRIEF)
-                    length = len_map.get(str(body.get("audio_length") or "short").lower(),
-                                         AudioLength.SHORT)
-                    instructions = str(
-                        body.get("audio_instructions") or "").strip()[:4000] or None
-                    st = await client.artifacts.generate_audio(
-                        nb_id, source_ids=src, audio_format=fmt,
-                        audio_length=length, language=lang,
-                        instructions=instructions)
-                    tid = _artifact_task_id(st)
-                    st_state = str(getattr(st, "status", "") or "").lower()
-                    # A kickoff can return a task id whose generation is
-                    # already FAILED (e.g. quota) — do not queue a dead task.
-                    if tid and "fail" in st_state:
-                        rejected["audio"] = str(
-                            getattr(st, "error", None)
-                            or getattr(st, "error_code", None)
-                            or "generation rejected at kickoff")
-                    elif tid:
-                        tasks["audio"] = tid
+                    try:
+                        from notebooklm import AudioFormat, AudioLength
+                        fmt_map = {"brief": AudioFormat.BRIEF,
+                                   "deep_dive": AudioFormat.DEEP_DIVE,
+                                   "critique": AudioFormat.CRITIQUE,
+                                   "debate": AudioFormat.DEBATE}
+                        len_map = {"short": AudioLength.SHORT,
+                                   "default": AudioLength.DEFAULT,
+                                   "long": AudioLength.LONG}
+                        fmt = fmt_map.get(
+                            str(body.get("audio_format") or "brief").lower(),
+                            AudioFormat.BRIEF)
+                        length = len_map.get(
+                            str(body.get("audio_length") or "short").lower(),
+                            AudioLength.SHORT)
+                        instructions = str(
+                            body.get("audio_instructions") or "").strip()[:4000] or None
+                        st = await client.artifacts.generate_audio(
+                            nb_id, source_ids=src, audio_format=fmt,
+                            audio_length=length, language=lang,
+                            instructions=instructions)
+                        _collect_task(tasks, rejected, "audio", st)
+                    except Exception as e:
+                        rejected["audio"] = f"{type(e).__name__}: {e}"
                 if "quiz" in kinds:
-                    from notebooklm import QuizQuantity, QuizDifficulty
-                    q_map = {"fewer": QuizQuantity.FEWER,
-                             "standard": QuizQuantity.STANDARD,
-                             "more": QuizQuantity.MORE}
-                    d_map = {"easy": QuizDifficulty.EASY,
-                             "medium": QuizDifficulty.MEDIUM,
-                             "hard": QuizDifficulty.HARD}
-                    qty = q_map.get(str(body.get("quiz_quantity") or "standard").lower(),
-                                    QuizQuantity.STANDARD)
-                    diff = d_map.get(str(body.get("quiz_difficulty") or "medium").lower(),
-                                     QuizDifficulty.MEDIUM)
-                    # generate_quiz has no language param — language and any
-                    # custom style both travel through `instructions`. Use the
-                    # human language name when sent ("Vietnamese" lands better
-                    # in prompt text than the "vi" code).
-                    q_instructions = str(
-                        body.get("quiz_instructions") or "").strip()[:4000]
-                    lang_name = str(
-                        body.get("lang_name") or "").strip() or lang
-                    if lang and not lang.lower().startswith("en"):
-                        lang_dir = (f"Write every question, option, and "
-                                    f"explanation entirely in {lang_name}.")
-                        q_instructions = (f"{lang_dir} {q_instructions}").strip()
-                    st = await client.artifacts.generate_quiz(
-                        nb_id, source_ids=src,
-                        instructions=q_instructions or None,
-                        quantity=qty, difficulty=diff)
-                    tid = _artifact_task_id(st)
-                    st_state = str(getattr(st, "status", "") or "").lower()
-                    if tid and "fail" in st_state:
-                        rejected["quiz"] = str(
-                            getattr(st, "error", None)
-                            or getattr(st, "error_code", None)
-                            or "generation rejected at kickoff")
-                    elif tid:
-                        tasks["quiz"] = tid
+                    try:
+                        from notebooklm import QuizQuantity, QuizDifficulty
+                        q_map = {"fewer": QuizQuantity.FEWER,
+                                 "standard": QuizQuantity.STANDARD,
+                                 "more": QuizQuantity.MORE}
+                        d_map = {"easy": QuizDifficulty.EASY,
+                                 "medium": QuizDifficulty.MEDIUM,
+                                 "hard": QuizDifficulty.HARD}
+                        qty = q_map.get(
+                            str(body.get("quiz_quantity") or "standard").lower(),
+                            QuizQuantity.STANDARD)
+                        diff = d_map.get(
+                            str(body.get("quiz_difficulty") or "medium").lower(),
+                            QuizDifficulty.MEDIUM)
+                        # generate_quiz has no language param — language and
+                        # any custom style both travel through `instructions`.
+                        # Use the human language name when sent ("Vietnamese"
+                        # lands better in prompt text than the "vi" code).
+                        q_instructions = str(
+                            body.get("quiz_instructions") or "").strip()[:4000]
+                        if lang and not lang.lower().startswith("en"):
+                            lang_dir = (f"Write every question, option, and "
+                                        f"explanation entirely in {lang_name}.")
+                            q_instructions = (
+                                f"{lang_dir} {q_instructions}").strip()
+                        st = await client.artifacts.generate_quiz(
+                            nb_id, source_ids=src,
+                            instructions=q_instructions or None,
+                            quantity=qty, difficulty=diff)
+                        _collect_task(tasks, rejected, "quiz", st)
+                    except Exception as e:
+                        rejected["quiz"] = f"{type(e).__name__}: {e}"
+                if "video" in kinds:
+                    try:
+                        await _gen_video(client, nb_id, src, lang, lang_name,
+                                         body, tasks, rejected)
+                    except Exception as e:
+                        rejected["video"] = f"{type(e).__name__}: {e}"
         finally:
             try:
                 await client.close()
@@ -754,21 +865,22 @@ async def artifact_status(request: Request):
 
 @app.get("/artifact/download")
 async def artifact_download(request: Request):
-    """?task_id=&kind=audio|quiz&profile= — audio returns the binary file,
-    quiz returns parsed JSON."""
+    """?task_id=&kind=audio|quiz|video&profile= — audio/video return the
+    binary file, quiz returns parsed JSON."""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     task_id = request.query_params.get("task_id") or ""
     kind = (request.query_params.get("kind") or "audio").lower()
     profile = request.query_params.get("profile") or "p1"
     if not task_id or kind not in _ARTIFACT_KINDS:
-        return _err(400, "bad_request", "task_id + kind(audio|quiz) required")
+        return _err(400, "bad_request",
+                    "task_id + kind(audio|quiz|video) required")
     if MOCK:
         if kind == "quiz":
             return {"status": "success", "quiz": [
                 {"question": "Mock question?", "options": ["A", "B"],
                  "answer_index": 0, "explanation": "mock"}]}
-        return _err(400, "bad_request", "audio download not mocked")
+        return _err(400, "bad_request", "media download not mocked")
 
     from notebooklm import NotebookLMClient
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -784,6 +896,12 @@ async def artifact_download(request: Request):
                         nb_id, str(out), artifact_id=task_id)
                     return FileResponse(str(out), media_type="audio/mpeg",
                                         filename=f"{safe_task}.mp3")
+                if kind == "video":
+                    out = _ARTIFACT_DIR / f"{safe_task}.mp4"
+                    await client.artifacts.download_video(
+                        nb_id, str(out), artifact_id=task_id)
+                    return FileResponse(str(out), media_type="video/mp4",
+                                        filename=f"{safe_task}.mp4")
                 out = _ARTIFACT_DIR / f"{safe_task}.json"
                 await client.artifacts.download_quiz(
                     nb_id, str(out), artifact_id=task_id, output_format="json")

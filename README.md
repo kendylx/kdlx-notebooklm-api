@@ -3,7 +3,7 @@
 HTTP bridge tự host cho **Google NotebookLM**, xây trên [`notebooklm-py`](https://github.com/teng-lin/notebooklm-py) (FastAPI + Docker). Plugin WordPress `kdlx-ai-kontent` gọi bridge này để:
 
 - **Research** — nạp URL nguồn vào notebook, hỏi và trả về `evidence_pack` có cấu trúc (claims, hard numbers, conflicts, coverage matrix, freshness…)
-- **Artifacts** — sinh Audio Overview (MP3) và Quiz (JSON) từ Studio của NotebookLM
+- **Artifacts** — sinh Audio Overview (MP3), Quiz (JSON) và Video Overview (MP4) từ Studio của NotebookLM
 
 Không phụ thuộc license/server của bên thứ ba — chỉ cần một tài khoản Google đã đăng nhập NotebookLM.
 
@@ -34,9 +34,9 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `GET /profiles` | Liệt kê profile đã có `storage_state.json` |
 | `POST /auth` | Upload session: Playwright `storage_state`, mảng Cookie-Editor, hoặc chuỗi `Cookie:` header. `{"profile": "auto"}` = tự gán `p1, p2, …` |
 | `POST /research` | `{"keyword", "urls": [], "profile", "mode": "fast"|"deep", "timeout"}` → `evidence_pack` |
-| `POST /artifact` | `{"kind": "audio"|"quiz"|"both", "urls": [permalink], "profile", "lang", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard}` → `{"tasks": {"audio": "<task_id>"}}` |
+| `POST /artifact` | `{"kind": "audio"|"quiz"|"video"|"both"|"all"|"audio,video" (comma/pipe list; both=audio+quiz, all=mọi kind), "urls": [permalink], "profile", "lang", "lang_name", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "audio_instructions", "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard, "quiz_instructions", "video_format": explainer/brief/cinematic/short, "video_style": auto/classic/whiteboard/kawaii/anime/watercolor/retro_print/heritage/paper_craft/custom, "video_style_prompt" (bắt buộc khi style=custom), "video_instructions"}` → `{"tasks": {"audio": "<task_id>"}, "rejected"?: {…}}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
-| `GET /artifact/download?task_id=&kind=audio|quiz&profile=` | Audio → file MP3. Quiz → `{"status":"success","quiz":[…]}` |
+| `GET /artifact/download?task_id=&kind=audio|quiz|video&profile=` | Audio → MP3. Video → MP4. Quiz → `{"status":"success","quiz":[…]}` |
 | `POST /serp` | Proxy tới AIBG serp service bên ngoài — trả đúng shape plugin đọc |
 
 Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL bạn truyền vào.
@@ -201,7 +201,7 @@ curl -H "Authorization: Bearer <t>" http://localhost:8767/status?profile=p1
 | `auth_missing` / `no_credentials` | Profile chưa có session → `push-profile.sh` hoặc `POST /auth` |
 | `invalid_credentials` sau upload | Cookie hết hạn/thiếu — export lại từ trình duyệt đã login `notebooklm.google.com` |
 | `upstream_error` trên `/artifact` | NotebookLM không nhận source — URL phải public, không bị chặn bot |
-| `/artifact/status` mãi `pending` | Google đang render — audio/quiz mất vài phút, poll tiếp |
+| `/artifact/status` mãi `pending` | Google đang render — audio/quiz mất vài phút, video tới ~30-60 phút (cinematic ~1h), poll tiếp |
 | Sau rebuild mất login | Đã đổi/xoá mount `/data` — đảm bảo bind-mount `$HOME/.notebooklm` hoặc volume `nlm-data` còn nguyên |
 | `401 unauthorized` | `NLM_BRIDGE_TOKEN` trên bridge ≠ token client gửi — check `.env` |
 
