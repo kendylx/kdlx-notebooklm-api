@@ -801,8 +801,16 @@ async def artifact_start(request: Request):
                     scoped_ids += await _artifact_add_text(
                         client, nb_id, title, content, timeout)
                 if urls:
-                    scoped_ids += await _artifact_add_sources(
-                        client, nb_id, urls, timeout)
+                    # URLs are best-effort extras — a dead or unreachable
+                    # permalink (localhost, bot-protected staging) must not
+                    # abort a cycle whose text source already registered.
+                    try:
+                        scoped_ids += await _artifact_add_sources(
+                            client, nb_id, urls, timeout)
+                    except RuntimeError as e:
+                        if not scoped_ids:
+                            raise
+                        rejected["_sources"] = str(e)
                 # Never let generation fall back to `source_ids=None` —
                 # that resolves to EVERY source in the shared per-profile
                 # notebook, so artifacts would be built from other posts.
