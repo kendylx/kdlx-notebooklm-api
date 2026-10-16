@@ -895,10 +895,12 @@ async def artifact_status(request: Request):
 
 @app.post("/artifact/cleanup")
 async def artifact_cleanup(request: Request):
-    """{"profile": str, "source_ids": [str, ...]} — delete text sources the
-    caller registered on the shared ai-seo:<profile> notebook. The notebook
-    would otherwise accumulate one source per post and hit NotebookLM's
-    per-notebook source cap; deletion is per-source best-effort."""
+    """{"profile": str, "source_ids": [str, ...], "all": bool} — delete text
+    sources the caller registered on the shared ai-seo:<profile> notebook.
+    The notebook would otherwise accumulate one source per post and hit
+    NotebookLM's per-notebook source cap; deletion is per-source
+    best-effort. "all": true lists and deletes every source — the recovery
+    path for a notebook that already hit the cap."""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     try:
@@ -908,10 +910,11 @@ async def artifact_cleanup(request: Request):
     if not isinstance(body, dict):
         return _err(400, "bad_json", "request body must be a JSON object")
     profile = str(body.get("profile") or "p1")
+    wipe_all = bool(body.get("all"))
     ids = [str(s) for s in (body.get("source_ids") or [])
            if isinstance(s, (str, int))][:50]
-    if not ids:
-        return _err(400, "bad_request", "source_ids is required")
+    if not ids and not wipe_all:
+        return _err(400, "bad_request", "source_ids (or all:true) required")
     if MOCK:
         return {"status": "success", "deleted": len(ids)}
 
@@ -921,6 +924,18 @@ async def artifact_cleanup(request: Request):
             client = await NotebookLMClient.from_storage(_storage_path(profile))
             async with client:
                 nb_id = await _artifact_notebook(client, profile)
+                if wipe_all:
+                    # Recovery path for a notebook that hit the source cap:
+                    # every listed source goes, regardless of who added it.
+                    try:
+                        listed = await client.sources.list(nb_id)
+                        ids = [str(getattr(s, "id", None)
+                                   or getattr(s, "source_id", None))
+                               for s in listed]
+                        ids = [s for s in ids if s and s != "None"][:100]
+                    except Exception as e:
+                        return _err(502, "upstream_error",
+                                    f"list sources: {_err_cause(e)}")
                 deleted = 0
                 failed = []
                 for sid in ids:
