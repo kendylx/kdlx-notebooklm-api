@@ -88,6 +88,20 @@ def _err(status: int, code: str, message: str) -> JSONResponse:
         "status": "error", "error": {"code": code, "message": message}})
 
 
+def _err_cause(e: Exception) -> str:
+    """'Type: msg' plus the chained cause — the library wraps raw RPC
+    failures (SourceAddError etc.) in friendlier messages that hide the
+    real wire error unless we walk __cause__."""
+    parts = [f"{type(e).__name__}: {e}"]
+    seen = {id(e)}
+    cur = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+    while cur is not None and id(cur) not in seen and len(parts) < 3:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {cur}")
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return " <- ".join(parts)[:600]
+
+
 def _strs(raw, limit: int = 15) -> list:
     return [str(v).strip() for v in (raw or [])
             if isinstance(v, (str, int, float)) and str(v).strip()][:limit]
@@ -493,7 +507,7 @@ async def research(request: Request):
             return _err(502, "auth_missing",
                         "~/.notebooklm/storage_state.json not found — run the login flow")
         except Exception as e:
-            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+            return _err(502, "upstream_error", _err_cause(e))
     return {"status": "success", "profile": profile, "mode": mode,
             "asks": 2 if gap_ok else 1,
             "evidence_pack": pack}
@@ -537,6 +551,7 @@ async def _artifact_notebook(client, profile: str) -> str:
 
 async def _artifact_add_sources(client, nb_id: str, urls: list, timeout: int) -> list:
     scoped_ids: list[str] = []
+    first_err: Exception | None = None
     for url in urls[:MAX_URLS]:
         try:
             src = await client.sources.add_url(nb_id, url, wait=True,
@@ -544,8 +559,13 @@ async def _artifact_add_sources(client, nb_id: str, urls: list, timeout: int) ->
             sid = getattr(src, "id", None) or getattr(src, "source_id", None)
             if sid:
                 scoped_ids.append(str(sid))
-        except Exception:
+        except Exception as e:
+            if first_err is None:
+                first_err = e
             continue
+    if urls and not scoped_ids and first_err is not None:
+        raise RuntimeError(f"add_url failed for all sources: "
+                           f"{type(first_err).__name__}: {first_err}")
     return scoped_ids
 
 
@@ -809,7 +829,7 @@ async def artifact_start(request: Request):
             return _err(502, "auth_missing",
                         "storage_state.json not found — run the login flow")
         except Exception as e:
-            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+            return _err(502, "upstream_error", _err_cause(e))
     tasks = result["tasks"]
     rejected = result["rejected"]
     if not tasks:
@@ -870,7 +890,7 @@ async def artifact_status(request: Request):
         except FileNotFoundError:
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
-            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+            return _err(502, "upstream_error", _err_cause(e))
 
 
 @app.post("/artifact/cleanup")
@@ -914,7 +934,7 @@ async def artifact_cleanup(request: Request):
         except FileNotFoundError:
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
-            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+            return _err(502, "upstream_error", _err_cause(e))
 
 
 # --------------------------------------------------------------------------
@@ -1153,7 +1173,7 @@ async def artifact_download(request: Request):
         except FileNotFoundError:
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
-            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+            return _err(502, "upstream_error", _err_cause(e))
     # kind == "video" reaches here with `out` holding the raw MP4.
     try:
         final_path, public_url = await _process_video(
@@ -1293,7 +1313,7 @@ async def serp(request: Request):
         async with httpx.AsyncClient(timeout=60) as http:
             r = await http.post(AIBG_URL, json=fwd, headers=headers)
     except Exception as e:
-        return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+        return _err(502, "upstream_error", _err_cause(e))
     if not 200 <= r.status_code < 300:
         detail = r.text[:300].strip()
         return _err(502, "upstream_error",
