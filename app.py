@@ -921,7 +921,11 @@ async def _fetch_watermark(url: str) -> Path:
     dest = _ARTIFACT_DIR / f"wm-{hashlib.md5(url.encode()).hexdigest()[:16]}"
     if dest.exists() and dest.stat().st_size > 0:
         return dest
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
+    # Many CDNs 403 the bare httpx UA — send a plain browser UA so image
+    # hosts served behind Cloudflare/Wikimedia-style front ends respond.
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; nlm-bridge/1.0)"}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                 headers=headers) as http:
         r = await http.get(url)
         if r.status_code != 200:
             raise _ProcessError(f"watermark fetch HTTP {r.status_code}")
