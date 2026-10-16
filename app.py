@@ -1074,7 +1074,10 @@ async def _probe_video(path: Path) -> tuple:
     try:
         info = json.loads(out)
         stream = (info.get("streams") or [{}])[0]
-        return (float(info["format"]["duration"]),
+        # Still images (PNG infographic) have no format.duration — the
+        # callers only need width/height there, so default 0 rather than
+        # failing the probe.
+        return (float((info.get("format") or {}).get("duration") or 0.0),
                 int(stream.get("width") or 0), int(stream.get("height") or 0))
     except Exception as e:
         raise _ProcessError(f"ffprobe parse: {e}")
