@@ -863,10 +863,189 @@ async def artifact_status(request: Request):
             return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
 
 
+# --------------------------------------------------------------------------
+# Video post-processing — ffmpeg trim/watermark + optional R2 upload.
+# All heavy lifting happens here on the bridge (not in PHP) so WordPress just
+# receives either a processed MP4 or a JSON {"url": <r2>}.
+
+
+class _ProcessError(Exception):
+    pass
+
+
+def _fparam(params, name: str, lo: float, hi: float, default: float) -> float:
+    try:
+        v = float(params.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+async def _run_cmd(*argv: str) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE)
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        tail = (stderr or b"").decode(errors="replace")[-400:]
+        raise _ProcessError(f"{argv[0]} rc={proc.returncode}: {tail}")
+
+
+async def _probe_video(path: Path) -> tuple:
+    """(duration_seconds, width, height) via ffprobe."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise _ProcessError("ffprobe failed: "
+                            + (stderr or b"").decode(errors="replace")[-300:])
+    try:
+        info = json.loads(out)
+        stream = (info.get("streams") or [{}])[0]
+        return (float(info["format"]["duration"]),
+                int(stream.get("width") or 0), int(stream.get("height") or 0))
+    except Exception as e:
+        raise _ProcessError(f"ffprobe parse: {e}")
+
+
+async def _fetch_watermark(url: str) -> Path:
+    """Download the overlay image once per URL and cache it under the
+    artifact dir — repeat posts reuse the cached copy."""
+    if not re.match(r"^https?://", url or ""):
+        raise _ProcessError("watermark must be a public http(s) URL")
+    import hashlib
+    import httpx
+    dest = _ARTIFACT_DIR / f"wm-{hashlib.md5(url.encode()).hexdigest()[:16]}"
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
+        r = await http.get(url)
+        if r.status_code != 200:
+            raise _ProcessError(f"watermark fetch HTTP {r.status_code}")
+        if len(r.content) > 5 * 1024 * 1024:
+            raise _ProcessError("watermark image >5MB")
+        dest.write_bytes(r.content)
+    return dest
+
+
+_WM_POS_EXPR = {
+    "tl": ("{m}", "{m}"),
+    "tr": ("W-w-{m}", "{m}"),
+    "bl": ("{m}", "H-h-{m}"),
+    "br": ("W-w-{m}", "H-h-{m}"),
+}
+
+
+async def _process_video(src: Path, safe_task: str, params) -> tuple:
+    """Trim + watermark via ffmpeg, optionally push to Cloudflare R2.
+    Returns (path_to_serve_or_None, public_url_or_None)."""
+    trim_start = _fparam(params, "trim_start", 0, 600, 0)
+    trim_end = _fparam(params, "trim_end", 0, 600, 0)
+    wm_url = (params.get("watermark") or "").strip()
+    wm_pos = (params.get("wm_pos") or "br").lower()
+    if wm_pos not in _WM_POS_EXPR:
+        wm_pos = "br"
+    wm_pct = _fparam(params, "wm_width", 5, 40, 15)
+    wm_margin = int(_fparam(params, "wm_margin", 0, 200, 24))
+    want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
+
+    needs_ffmpeg = bool(wm_url) or trim_start > 0 or trim_end > 0
+    out = src
+    if needs_ffmpeg:
+        duration, width, _ = await _probe_video(src)
+        keep = duration - trim_start - trim_end
+        if duration > 0 and keep <= 0.5:
+            raise _ProcessError(
+                f"trim removes the whole video (dur={duration:.1f}s, "
+                f"trim={trim_start}+{trim_end}s)")
+        argv = ["ffmpeg", "-y"]
+        if trim_start > 0:
+            argv += ["-ss", f"{trim_start:.2f}"]
+        argv += ["-i", str(src)]
+        if wm_url:
+            wm = await _fetch_watermark(wm_url)
+            argv += ["-i", str(wm)]
+            wm_px = max(16, round(width * wm_pct / 100)) if width else 160
+            x, y = _WM_POS_EXPR[wm_pos]
+            argv += [
+                "-filter_complex",
+                f"[1:v]scale={wm_px}:-2[wm];[0:v][wm]overlay="
+                f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]",
+                "-map", "[v]", "-map", "0:a?"]
+        # -t is an *output* option — it must sit after every -i, otherwise
+        # it applies to the next input (the watermark image) and the real
+        # video keeps its full tail.
+        if duration > 0 and keep < duration:
+            argv += ["-t", f"{keep:.2f}"]
+        # Re-encode for frame-accurate cuts and a clean overlay bake.
+        argv += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 "-c:a", "aac", "-b:a", "128k"]
+        out = src.with_name(f"{safe_task}.proc.mp4")
+        argv += [str(out)]
+        await _run_cmd(*argv)
+
+    if want_r2:
+        url = await _upload_r2(out, safe_task, params)
+        try:
+            if out != src:
+                out.unlink(missing_ok=True)
+            src.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None, url
+    return out, None
+
+
+async def _upload_r2(path: Path, safe_task: str, params) -> str:
+    """S3-compatible upload to Cloudflare R2. Credentials live in env on the
+    bridge; the plugin only sends bucket/prefix/public-base overrides."""
+    acct = os.environ.get("NLM_R2_ACCOUNT_ID", "").strip()
+    key_id = os.environ.get("NLM_R2_ACCESS_KEY_ID", "").strip()
+    secret = os.environ.get("NLM_R2_SECRET_ACCESS_KEY", "").strip()
+    bucket = (params.get("r2_bucket") or os.environ.get("NLM_R2_BUCKET") or "").strip()
+    public_base = (params.get("r2_public_base")
+                   or os.environ.get("NLM_R2_PUBLIC_BASE") or "").strip().rstrip("/")
+    if not (acct and key_id and secret and bucket and public_base):
+        raise _ProcessError(
+            "R2 upload requested but NLM_R2_ACCOUNT_ID/ACCESS_KEY_ID/"
+            "SECRET_ACCESS_KEY/BUCKET/PUBLIC_BASE are not all set")
+    prefix = (params.get("r2_prefix")
+              or os.environ.get("NLM_R2_PREFIX") or "").strip().strip("/")
+    key = f"{prefix}/{safe_task}.mp4" if prefix else f"{safe_task}.mp4"
+
+    def _do() -> None:
+        import boto3
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{acct}.r2.cloudflarestorage.com",
+            aws_access_key_id=key_id,
+            aws_secret_access_key=secret,
+            region_name="auto")
+        s3.upload_file(
+            str(path), bucket, key,
+            ExtraArgs={
+                "ContentType": "video/mp4",
+                "CacheControl": "public, max-age=31536000, immutable"})
+
+    try:
+        await asyncio.to_thread(_do)
+    except Exception as e:
+        raise _ProcessError(f"R2 upload: {type(e).__name__}: {e}")
+    return f"{public_base}/{key}"
+
+
 @app.get("/artifact/download")
 async def artifact_download(request: Request):
     """?task_id=&kind=audio|quiz|video&profile= — audio/video return the
-    binary file, quiz returns parsed JSON."""
+    binary file, quiz returns parsed JSON. For kind=video the optional
+    params trim_start/trim_end (seconds), watermark (image URL), wm_pos,
+    wm_width (%), wm_margin (px) post-process via ffmpeg, and r2=1 (+
+    r2_bucket/r2_prefix/r2_public_base overrides) uploads to Cloudflare R2
+    and returns {"status":"success","url":...} instead of the binary."""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     task_id = request.query_params.get("task_id") or ""
@@ -900,20 +1079,37 @@ async def artifact_download(request: Request):
                     out = _ARTIFACT_DIR / f"{safe_task}.mp4"
                     await client.artifacts.download_video(
                         nb_id, str(out), artifact_id=task_id)
-                    return FileResponse(str(out), media_type="video/mp4",
-                                        filename=f"{safe_task}.mp4")
-                out = _ARTIFACT_DIR / f"{safe_task}.json"
-                await client.artifacts.download_quiz(
-                    nb_id, str(out), artifact_id=task_id, output_format="json")
-                try:
-                    data = json.loads(out.read_text(encoding="utf-8"))
-                except Exception:
-                    data = {"raw": out.read_text(encoding="utf-8", errors="replace")}
-                return {"status": "success", "quiz": data}
+                    # Fall through: ffmpeg trim/watermark + R2 upload run
+                    # after the NotebookLM client session closes below.
+                else:
+                    out = _ARTIFACT_DIR / f"{safe_task}.json"
+                    await client.artifacts.download_quiz(
+                        nb_id, str(out), artifact_id=task_id,
+                        output_format="json")
+                    try:
+                        data = json.loads(out.read_text(encoding="utf-8"))
+                    except Exception:
+                        data = {"raw": out.read_text(
+                            encoding="utf-8", errors="replace")}
+                    return {"status": "success", "quiz": data}
         except FileNotFoundError:
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
             return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+    # kind == "video" reaches here with `out` holding the raw MP4.
+    try:
+        final_path, public_url = await _process_video(
+            out, safe_task, request.query_params)
+    except _ProcessError as e:
+        return _err(502, "video_process_failed", str(e))
+    except FileNotFoundError:
+        return _err(502, "video_process_failed",
+                    "ffmpeg/ffprobe not installed on the bridge")
+    if public_url:
+        return {"status": "success", "url": public_url,
+                "processed": final_path is None}
+    return FileResponse(str(final_path), media_type="video/mp4",
+                        filename=f"{safe_task}.mp4")
 
 
 # --------------------------------------------------------------------------

@@ -36,7 +36,7 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `POST /research` | `{"keyword", "urls": [], "profile", "mode": "fast"|"deep", "timeout"}` → `evidence_pack` |
 | `POST /artifact` | `{"kind": "audio"|"quiz"|"video"|"both"|"all"|"audio,video" (comma/pipe list; both=audio+quiz, all=mọi kind), "urls": [permalink], "profile", "lang", "lang_name", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "audio_instructions", "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard, "quiz_instructions", "video_format": explainer/brief/cinematic/short, "video_style": auto/classic/whiteboard/kawaii/anime/watercolor/retro_print/heritage/paper_craft/custom, "video_style_prompt" (bắt buộc khi style=custom), "video_instructions"}` → `{"tasks": {"audio": "<task_id>"}, "rejected"?: {…}}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
-| `GET /artifact/download?task_id=&kind=audio|quiz|video&profile=` | Audio → MP3. Video → MP4. Quiz → `{"status":"success","quiz":[…]}` |
+| `GET /artifact/download?task_id=&kind=audio|quiz|video&profile=` | Audio → MP3. Video → MP4. Quiz → `{"status":"success","quiz":[…]}`. Video nhận thêm params post-process: `trim_start`/`trim_end` (giây, cắt đầu/cuối qua ffmpeg), `watermark` (URL PNG) + `wm_pos` (tl/tr/bl/br) + `wm_width` (% bề ngang) + `wm_margin` (px), và `r2=1` (+`r2_bucket`/`r2_prefix`/`r2_public_base` ghi đè env) → trả `{"status":"success","url":"<R2 public>"}` thay vì binary |
 | `POST /serp` | Proxy tới AIBG serp service bên ngoài — trả đúng shape plugin đọc |
 
 Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL bạn truyền vào.
@@ -193,6 +193,14 @@ curl -H "Authorization: Bearer <t>" http://localhost:8767/status?profile=p1
 | `NLM_ARTIFACT_DIR` | `/tmp/nlm-artifacts` | Nơi đệm file MP3/JSON trước khi trả về |
 | `NLM_MOCK` | — | `1` = mock mode, không gọi Google |
 | `NLM_HOST_DIR` | `$HOME/.notebooklm` | (compose local) thư mục host bind-mount vào `/data` |
+| `NLM_R2_ACCOUNT_ID` | — | Cloudflare account id — cần cho upload R2 của video |
+| `NLM_R2_ACCESS_KEY_ID` / `NLM_R2_SECRET_ACCESS_KEY` | — | R2 API token pair (S3-compatible) |
+| `NLM_R2_BUCKET` | — | Bucket mặc định (plugin có thể ghi đè qua `r2_bucket`) |
+| `NLM_R2_PREFIX` | — | Thư mục con trong bucket, vd `videos/mysite` |
+| `NLM_R2_PUBLIC_BASE` | — | Public/CDN base URL của bucket, vd `https://cdn.example.com` |
+
+Video post-process cần `ffmpeg` + `ffprobe` trong image (Dockerfile đã cài).
+Khi `r2=1`: file local xoá sau upload; key = `<prefix>/<task_id>.mp4` (idempotent — re-download cùng task ghi đè cùng key).
 
 ## Troubleshooting
 

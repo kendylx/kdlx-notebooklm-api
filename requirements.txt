@@ -2,3 +2,4 @@ fastapi==0.142.2
 uvicorn==0.54.0
 notebooklm-py==0.8.5
 httpx==0.28.1
+boto3==1.34.162
