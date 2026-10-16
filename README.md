@@ -37,9 +37,10 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `POST /artifact` | `{"kind": "audio"|"quiz"|"video"|"both"|"all"|"audio,video" (comma/pipe list; both=audio+quiz, all=mọi kind), "urls": [permalink], "profile", "lang", "lang_name", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "audio_instructions", "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard, "quiz_instructions", "video_format": explainer/brief/cinematic/short, "video_style": auto/classic/whiteboard/kawaii/anime/watercolor/retro_print/heritage/paper_craft/custom, "video_style_prompt" (bắt buộc khi style=custom), "video_instructions"}` → `{"tasks": {"audio": "<task_id>"}, "rejected"?: {…}}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
 | `GET /artifact/download?task_id=&kind=audio|quiz|video&profile=` | Audio → MP3. Video → MP4. Quiz → `{"status":"success","quiz":[…]}`. Video nhận thêm params post-process: `trim_start`/`trim_end` (giây, cắt đầu/cuối qua ffmpeg), `watermark` (URL PNG) + `wm_pos` (tl/tr/bl/br) + `wm_width` (% bề ngang) + `wm_margin` (px), và `r2=1` (+`r2_bucket`/`r2_prefix`/`r2_public_base` ghi đè env) → trả `{"status":"success","url":"<R2 public>"}` thay vì binary |
+| `POST /artifact/cleanup` | `{"profile", "source_ids":[…]}` — xoá text sources đã đăng trên notebook `ai-seo:<profile>` sau khi cycle artifact xong (NotebookLM giới hạn số sources/notebook); per-source best-effort → `{"deleted": n, "failed": []}` |
 | `POST /serp` | Proxy tới AIBG serp service bên ngoài — trả đúng shape plugin đọc |
 
-Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL bạn truyền vào.
+Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL/text bạn truyền vào. **Scoping bắt buộc**: source_ids được echo trong response của `/artifact`; nếu content/urls gửi lên mà không đăng ký được source nào → request bị từ chối thay vì generate trên toàn bộ notebook (tránh artifact lấy nhầm nội dung bài khác). Plugin gọi `/artifact/cleanup` sau khi cycle đóng để xoá source khỏi notebook.
 
 ### `/serp` — bọc AIBG service cho plugin trên hosting
 

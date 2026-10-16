@@ -873,6 +873,50 @@ async def artifact_status(request: Request):
             return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
 
 
+@app.post("/artifact/cleanup")
+async def artifact_cleanup(request: Request):
+    """{"profile": str, "source_ids": [str, ...]} — delete text sources the
+    caller registered on the shared ai-seo:<profile> notebook. The notebook
+    would otherwise accumulate one source per post and hit NotebookLM's
+    per-notebook source cap; deletion is per-source best-effort."""
+    if not _authed(request):
+        return _err(401, "unauthorized", "invalid bearer token")
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "bad_json", "request body must be a JSON object")
+    if not isinstance(body, dict):
+        return _err(400, "bad_json", "request body must be a JSON object")
+    profile = str(body.get("profile") or "p1")
+    ids = [str(s) for s in (body.get("source_ids") or [])
+           if isinstance(s, (str, int))][:50]
+    if not ids:
+        return _err(400, "bad_request", "source_ids is required")
+    if MOCK:
+        return {"status": "success", "deleted": len(ids)}
+
+    from notebooklm import NotebookLMClient
+    async with _lock:
+        try:
+            client = await NotebookLMClient.from_storage(_storage_path(profile))
+            async with client:
+                nb_id = await _artifact_notebook(client, profile)
+                deleted = 0
+                failed = []
+                for sid in ids:
+                    try:
+                        await client.sources.delete(nb_id, sid)
+                        deleted += 1
+                    except Exception as e:
+                        failed.append(f"{sid}: {type(e).__name__}")
+                return {"status": "success", "deleted": deleted,
+                        "failed": failed}
+        except FileNotFoundError:
+            return _err(502, "auth_missing", "storage_state.json not found")
+        except Exception as e:
+            return _err(502, "upstream_error", f"{type(e).__name__}: {e}")
+
+
 # --------------------------------------------------------------------------
 # Video post-processing — ffmpeg trim/watermark + optional R2 upload.
 # All heavy lifting happens here on the bridge (not in PHP) so WordPress just
