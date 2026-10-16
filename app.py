@@ -313,6 +313,19 @@ async def health():
     return {"ok": True, "mock": MOCK}
 
 
+@app.get("/version")
+async def version():
+    # app.py is COPY-baked into the image — its mtime inside the container is
+    # the fingerprint of the deployed code, so a redeploy can be verified
+    # without shell access. NLM_BUILD_SHA can pin an exact commit when set.
+    try:
+        mtime = int(os.path.getmtime(__file__))
+    except OSError:
+        mtime = 0
+    return {"app_mtime": mtime,
+            "build_sha": os.environ.get("NLM_BUILD_SHA", "")}
+
+
 def _authed(request: Request) -> bool:
     return request.headers.get("authorization", "") == f"Bearer {BRIDGE_TOKEN}"
 
