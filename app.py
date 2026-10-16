@@ -552,15 +552,16 @@ async def _artifact_add_sources(client, nb_id: str, urls: list, timeout: int) ->
 async def _artifact_add_text(client, nb_id: str, title: str, content: str,
                              timeout: int) -> list:
     """Paste article text as the source — works for localhost/private sites
-    and pages behind bot protection where add_url would silently fail."""
-    try:
-        src = await client.sources.add_text(nb_id, title[:250], content,
-                                            wait=True,
-                                            wait_timeout=min(120, timeout))
-        sid = getattr(src, "id", None) or getattr(src, "source_id", None)
-        return [str(sid)] if sid else []
-    except Exception:
-        return []
+    and pages behind bot protection where add_url would silently fail.
+    Raises on failure: silently returning [] would unscope generation to
+    the WHOLE shared notebook (all previously uploaded posts)."""
+    src = await client.sources.add_text(nb_id, title[:250], content,
+                                        wait=True,
+                                        wait_timeout=min(120, timeout))
+    sid = getattr(src, "id", None) or getattr(src, "source_id", None)
+    if not sid:
+        raise RuntimeError("add_text returned no source id")
+    return [str(sid)]
 
 
 def _artifact_task_id(status) -> str | None:
@@ -714,7 +715,14 @@ async def artifact_start(request: Request):
                 if urls:
                     scoped_ids += await _artifact_add_sources(
                         client, nb_id, urls, timeout)
-                src = scoped_ids or None
+                # Never let generation fall back to `source_ids=None` —
+                # that resolves to EVERY source in the shared per-profile
+                # notebook, so artifacts would be built from other posts.
+                if not scoped_ids:
+                    raise RuntimeError(
+                        "source registration produced no source ids — "
+                        "refusing to generate on the shared notebook")
+                src = scoped_ids
                 lang_name = str(body.get("lang_name") or "").strip() or lang
 
                 # Per-kind isolation: a validation/quota error on one kind
@@ -789,7 +797,8 @@ async def artifact_start(request: Request):
                 await client.close()
             except Exception:
                 pass
-        return {"tasks": tasks, "rejected": rejected}
+        return {"tasks": tasks, "rejected": rejected,
+                "source_ids": scoped_ids}
 
     async with _lock:
         try:
@@ -807,7 +816,8 @@ async def artifact_start(request: Request):
         detail = "; ".join(f"{k}: {v}" for k, v in rejected.items()) \
             or "no artifact task accepted"
         return _err(502, "upstream_error", detail)
-    resp = {"status": "success", "profile": profile, "tasks": tasks}
+    resp = {"status": "success", "profile": profile, "tasks": tasks,
+            "source_ids": result["source_ids"]}
     if rejected:
         resp["rejected"] = rejected
     return resp
