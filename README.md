@@ -34,10 +34,10 @@ Tất cả endpoint (trừ `/health`) yêu cầu header `Authorization: Bearer <
 | `GET /profiles` | Liệt kê profile đã có `storage_state.json` |
 | `POST /auth` | Upload session: Playwright `storage_state`, mảng Cookie-Editor, hoặc chuỗi `Cookie:` header. `{"profile": "auto"}` = tự gán `p1, p2, …` |
 | `POST /research` | `{"keyword", "urls": [], "profile", "mode": "fast"|"deep", "timeout"}` → `evidence_pack` |
-| `POST /artifact` | `{"kind": "audio"|"quiz"|"video"|"both"|"all"|"audio,video" (comma/pipe list; both=audio+quiz, all=mọi kind), "urls": [permalink], "profile", "lang", "lang_name", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "audio_instructions", "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard, "quiz_instructions", "video_format": explainer/brief/cinematic/short, "video_style": auto/classic/whiteboard/kawaii/anime/watercolor/retro_print/heritage/paper_craft/custom, "video_style_prompt" (bắt buộc khi style=custom), "video_instructions"}` → `{"tasks": {"audio": "<task_id>"}, "rejected"?: {…}}` |
+| `POST /artifact` | `{"kind": "audio"|"quiz"|"video"|"infographic"|"datatable"|"both"|"all"|"audio,video" (comma/pipe list; both=audio+quiz, all=mọi kind), "urls": [permalink], "profile", "lang", "lang_name", "audio_format": brief/deep_dive/critique/debate, "audio_length": short/default/long, "audio_instructions", "quiz_quantity": fewer/standard/more, "quiz_difficulty": easy/medium/hard, "quiz_instructions", "video_format": explainer/brief/cinematic/short, "video_style": auto/classic/whiteboard/kawaii/anime/watercolor/retro_print/heritage/paper_craft/custom, "video_style_prompt" (bắt buộc khi style=custom), "video_instructions", "infographic_orientation": landscape/portrait/square, "infographic_detail": concise/standard/detailed, "infographic_style": auto/sketch/professional/bento/editorial/instructional/bricks/clay/anime/kawaii/scientific, "infographic_instructions", "datatable_instructions"}` → `{"tasks": {"audio": "<task_id>"}, "rejected"?: {…}, "source_ids": […]}` |
 | `GET /artifact/status?task_id=&profile=` | Poll: `pending`/`in_progress`/`completed`/`failed` |
-| `GET /artifact/download?task_id=&kind=audio|quiz|video&profile=` | Audio → MP3. Video → MP4. Quiz → `{"status":"success","quiz":[…]}`. Video nhận thêm params post-process: `trim_start`/`trim_end` (giây, cắt đầu/cuối qua ffmpeg), `watermark` (URL PNG) + `wm_pos` (tl/tr/bl/br) + `wm_width` (% bề ngang) + `wm_margin` (px), và `r2=1` (+`r2_bucket`/`r2_prefix`/`r2_public_base` ghi đè env) → trả `{"status":"success","url":"<R2 public>"}` thay vì binary |
-| `POST /artifact/cleanup` | `{"profile", "source_ids":[…]}` — xoá text sources đã đăng trên notebook `ai-seo:<profile>` sau khi cycle artifact xong (NotebookLM giới hạn số sources/notebook); per-source best-effort → `{"deleted": n, "failed": []}` |
+| `GET /artifact/download?task_id=&kind=audio|quiz|video|infographic|datatable&profile=` | Audio → MP3. Video → MP4. Infographic → PNG. Quiz → `{"status":"success","quiz":[…]}`. Datatable → `{"status":"success","table":{"headers":[…],"rows":[[…]]}}` (CSV parse sẵn). Video nhận `trim_start`/`trim_end` (giây) + infographic chỉ nhận phần ảnh: `watermark` (URL PNG) + `wm_pos` (tl/tr/bl/br) + `wm_width` (% bề ngang) + `wm_margin` (px); cả hai nhận `r2=1` (+`r2_bucket`/`r2_prefix`/`r2_public_base` ghi đè env) → trả `{"status":"success","url":"<R2 public>"}` thay vì binary |
+| `POST /artifact/cleanup` | `{"profile", "source_ids":[…] hoặc "all":true}` — xoá text sources đã đăng trên notebook `ai-seo:<profile>` sau khi cycle artifact xong (NotebookLM giới hạn số sources/notebook); per-source best-effort → `{"deleted": n, "failed": []}` |
 | `POST /serp` | Proxy tới AIBG serp service bên ngoài — trả đúng shape plugin đọc |
 
 Artifacts chạy trên notebook tên `ai-seo:<profile>` (tự tạo nếu chưa có), source = các URL/text bạn truyền vào. **Scoping bắt buộc**: source_ids được echo trong response của `/artifact`; nếu content/urls gửi lên mà không đăng ký được source nào → request bị từ chối thay vì generate trên toàn bộ notebook (tránh artifact lấy nhầm nội dung bài khác). Plugin gọi `/artifact/cleanup` sau khi cycle đóng để xoá source khỏi notebook.
@@ -191,10 +191,10 @@ curl -H "Authorization: Bearer <t>" http://localhost:8767/status?profile=p1
 |---|---|---|
 | `NLM_BRIDGE_TOKEN` | `test-secret-token` ⚠️ | Bearer token — **đổi ngay khi deploy** |
 | `NLM_STORAGE_DIR` | `/data/profiles` | Thư mục chứa session profiles trong container |
-| `NLM_ARTIFACT_DIR` | `/tmp/nlm-artifacts` | Nơi đệm file MP3/JSON trước khi trả về |
+| `NLM_ARTIFACT_DIR` | `/tmp/nlm-artifacts` | Nơi đệm file MP3/MP4/PNG/CSV/JSON trước khi trả về |
 | `NLM_MOCK` | — | `1` = mock mode, không gọi Google |
 | `NLM_HOST_DIR` | `$HOME/.notebooklm` | (compose local) thư mục host bind-mount vào `/data` |
-| `NLM_R2_ACCOUNT_ID` | — | Cloudflare account id — cần cho upload R2 của video |
+| `NLM_R2_ACCOUNT_ID` | — | Cloudflare account id — cần cho upload R2 của video/infographic |
 | `NLM_R2_ACCESS_KEY_ID` / `NLM_R2_SECRET_ACCESS_KEY` | — | R2 API token pair (S3-compatible) |
 | `NLM_R2_BUCKET` | — | Bucket mặc định (plugin có thể ghi đè qua `r2_bucket`) |
 | `NLM_R2_PREFIX` | — | Thư mục con trong bucket, vd `videos/mysite` |

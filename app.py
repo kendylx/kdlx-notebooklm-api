@@ -520,7 +520,7 @@ async def research(request: Request):
 # GET /artifact/download -> file/json once completed.
 # --------------------------------------------------------------------------
 
-_ARTIFACT_KINDS = ("audio", "quiz", "video")
+_ARTIFACT_KINDS = ("audio", "quiz", "video", "infographic", "datatable")
 
 
 def _parse_kinds(raw_kind: str) -> tuple | None:
@@ -615,6 +615,74 @@ _VIDEO_STYLES = {
     "watercolor": "WATERCOLOR", "retro_print": "RETRO_PRINT",
     "heritage": "HERITAGE", "paper_craft": "PAPER_CRAFT",
 }
+_INFO_ORIENTATIONS = {
+    "landscape": "LANDSCAPE", "portrait": "PORTRAIT", "square": "SQUARE",
+}
+_INFO_DETAILS = {
+    "concise": "CONCISE", "standard": "STANDARD", "detailed": "DETAILED",
+}
+# InfographicStyle — different codes than VideoStyle for shared names.
+_INFO_STYLES = {
+    "auto": "AUTO_SELECT", "sketch": "SKETCH_NOTE", "professional": "PROFESSIONAL",
+    "bento": "BENTO_GRID", "editorial": "EDITORIAL", "instructional": "INSTRUCTIONAL",
+    "bricks": "BRICKS", "clay": "CLAY", "anime": "ANIME", "kawaii": "KAWAII",
+    "scientific": "SCIENTIFIC",
+}
+
+
+async def _gen_infographic(client, nb_id: str, source_ids, lang: str,
+                           lang_name: str, body: dict,
+                           tasks: dict, rejected: dict) -> None:
+    """Infographic — PNG visual. Orientation/detail/style mirror the Studio
+    options; instructions carry the per-site consistency prompt."""
+    from notebooklm import (InfographicOrientation, InfographicDetail,
+                            InfographicStyle)
+    orient_name = str(body.get("infographic_orientation") or "landscape").lower()
+    detail_name = str(body.get("infographic_detail") or "standard").lower()
+    style_name = str(body.get("infographic_style") or "auto").lower()
+    if orient_name not in _INFO_ORIENTATIONS:
+        rejected["infographic"] = (
+            f"unknown infographic_orientation '{orient_name}' "
+            f"({'|'.join(_INFO_ORIENTATIONS)})")
+        return
+    if detail_name not in _INFO_DETAILS:
+        rejected["infographic"] = (
+            f"unknown infographic_detail '{detail_name}' "
+            f"({'|'.join(_INFO_DETAILS)})")
+        return
+    if style_name not in _INFO_STYLES:
+        rejected["infographic"] = (
+            f"unknown infographic_style '{style_name}' "
+            f"({'|'.join(_INFO_STYLES)})")
+        return
+    instructions = str(body.get("infographic_instructions") or "").strip()[:4000]
+    if lang and not lang.lower().startswith("en"):
+        lang_dir = (f"Write every label, heading, and caption "
+                    f"entirely in {lang_name}.")
+        instructions = f"{lang_dir} {instructions}".strip()
+    st = await client.artifacts.generate_infographic(
+        nb_id, source_ids=source_ids, language=lang,
+        instructions=instructions or None,
+        orientation=getattr(InfographicOrientation, _INFO_ORIENTATIONS[orient_name]),
+        detail_level=getattr(InfographicDetail, _INFO_DETAILS[detail_name]),
+        style=getattr(InfographicStyle, _INFO_STYLES[style_name]))
+    _collect_task(tasks, rejected, "infographic", st)
+
+
+async def _gen_datatable(client, nb_id: str, source_ids, lang: str,
+                         lang_name: str, body: dict,
+                         tasks: dict, rejected: dict) -> None:
+    """Data table — Studio builds a comparison table; the download path
+    returns parsed {headers, rows} the plugin renders as an HTML table."""
+    instructions = str(body.get("datatable_instructions") or "").strip()[:4000]
+    if lang and not lang.lower().startswith("en"):
+        lang_dir = (f"Write every column header and cell "
+                    f"entirely in {lang_name}.")
+        instructions = f"{lang_dir} {instructions}".strip()
+    st = await client.artifacts.generate_data_table(
+        nb_id, source_ids=source_ids, language=lang,
+        instructions=instructions or None)
+    _collect_task(tasks, rejected, "datatable", st)
 
 
 async def _gen_video(client, nb_id: str, source_ids, lang: str,
@@ -812,6 +880,18 @@ async def artifact_start(request: Request):
                                          body, tasks, rejected)
                     except Exception as e:
                         rejected["video"] = f"{type(e).__name__}: {e}"
+                if "infographic" in kinds:
+                    try:
+                        await _gen_infographic(client, nb_id, src, lang,
+                                               lang_name, body, tasks, rejected)
+                    except Exception as e:
+                        rejected["infographic"] = f"{type(e).__name__}: {e}"
+                if "datatable" in kinds:
+                    try:
+                        await _gen_datatable(client, nb_id, src, lang,
+                                             lang_name, body, tasks, rejected)
+                    except Exception as e:
+                        rejected["datatable"] = f"{type(e).__name__}: {e}"
         finally:
             try:
                 await client.close()
@@ -1093,7 +1173,59 @@ async def _process_video(src: Path, safe_task: str, params) -> tuple:
     return out, None
 
 
-async def _upload_r2(path: Path, safe_task: str, params) -> str:
+def _csv_to_table(text: str) -> dict:
+    """CSV text -> {"headers": [...], "rows": [[...]]} for plugin rendering."""
+    import csv
+    import io
+    rows = list(csv.reader(io.StringIO(text)))
+    rows = [r for r in rows if any(cell.strip() for cell in r)]
+    if not rows:
+        return {"headers": [], "rows": []}
+    return {"headers": rows[0], "rows": rows[1:]}
+
+
+async def _process_image(src: Path, safe_task: str, params) -> tuple:
+    """Watermark overlay on a still image (infographic PNG) + optional R2.
+    Same param surface as video minus trim; returns
+    (path_to_serve_or_None, public_url_or_None)."""
+    wm_url = (params.get("watermark") or "").strip()
+    wm_pos = (params.get("wm_pos") or "br").lower()
+    if wm_pos not in _WM_POS_EXPR:
+        wm_pos = "br"
+    wm_pct = _fparam(params, "wm_width", 5, 40, 15)
+    wm_margin = int(_fparam(params, "wm_margin", 0, 200, 24))
+    want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
+
+    out = src
+    if wm_url:
+        _, width, _ = await _probe_video(src)
+        wm = await _fetch_watermark(wm_url)
+        wm_px = max(16, round(width * wm_pct / 100)) if width else 160
+        x, y = _WM_POS_EXPR[wm_pos]
+        out = src.with_name(f"{safe_task}.proc.png")
+        await _run_cmd(
+            "ffmpeg", "-y", "-i", str(src), "-i", str(wm),
+            "-filter_complex",
+            f"[1:v]scale={wm_px}:-2[wm];[0:v][wm]overlay="
+            f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]",
+            "-map", "[v]", "-frames:v", "1", str(out))
+
+    if want_r2:
+        url = await _upload_r2(out, safe_task, params,
+                               ext="png", content_type="image/png")
+        try:
+            if out != src:
+                out.unlink(missing_ok=True)
+            src.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None, url
+    return out, None
+
+
+async def _upload_r2(path: Path, safe_task: str, params,
+                     ext: str = "mp4",
+                     content_type: str = "video/mp4") -> str:
     """S3-compatible upload to Cloudflare R2. Credentials live in env on the
     bridge; the plugin only sends bucket/prefix/public-base overrides."""
     acct = os.environ.get("NLM_R2_ACCOUNT_ID", "").strip()
@@ -1108,7 +1240,7 @@ async def _upload_r2(path: Path, safe_task: str, params) -> str:
             "SECRET_ACCESS_KEY/BUCKET/PUBLIC_BASE are not all set")
     prefix = (params.get("r2_prefix")
               or os.environ.get("NLM_R2_PREFIX") or "").strip().strip("/")
-    key = f"{prefix}/{safe_task}.mp4" if prefix else f"{safe_task}.mp4"
+    key = f"{prefix}/{safe_task}.{ext}" if prefix else f"{safe_task}.{ext}"
 
     def _do() -> None:
         import boto3
@@ -1121,7 +1253,7 @@ async def _upload_r2(path: Path, safe_task: str, params) -> str:
         s3.upload_file(
             str(path), bucket, key,
             ExtraArgs={
-                "ContentType": "video/mp4",
+                "ContentType": content_type,
                 "CacheControl": "public, max-age=31536000, immutable"})
 
     try:
@@ -1174,6 +1306,23 @@ async def artifact_download(request: Request):
                         nb_id, str(out), artifact_id=task_id)
                     # Fall through: ffmpeg trim/watermark + R2 upload run
                     # after the NotebookLM client session closes below.
+                elif kind == "infographic":
+                    out = _ARTIFACT_DIR / f"{safe_task}.png"
+                    await client.artifacts.download_infographic(
+                        nb_id, str(out), artifact_id=task_id)
+                    # Fall through to _process_image below (watermark/R2).
+                elif kind == "datatable":
+                    out = _ARTIFACT_DIR / f"{safe_task}.csv"
+                    await client.artifacts.download_data_table(
+                        nb_id, str(out), artifact_id=task_id)
+                    try:
+                        table = _csv_to_table(out.read_text(
+                            encoding="utf-8-sig", errors="replace"))
+                    except Exception:
+                        table = {"headers": [], "rows": [],
+                                 "raw": out.read_text(
+                                     encoding="utf-8", errors="replace")}
+                    return {"status": "success", "table": table}
                 else:
                     out = _ARTIFACT_DIR / f"{safe_task}.json"
                     await client.artifacts.download_quiz(
@@ -1189,10 +1338,14 @@ async def artifact_download(request: Request):
             return _err(502, "auth_missing", "storage_state.json not found")
         except Exception as e:
             return _err(502, "upstream_error", _err_cause(e))
-    # kind == "video" reaches here with `out` holding the raw MP4.
+    # kind == "video"|"infographic" reaches here with `out` holding the file.
     try:
-        final_path, public_url = await _process_video(
-            out, safe_task, request.query_params)
+        if kind == "video":
+            final_path, public_url = await _process_video(
+                out, safe_task, request.query_params)
+        else:
+            final_path, public_url = await _process_image(
+                out, safe_task, request.query_params)
     except _ProcessError as e:
         return _err(502, "video_process_failed", str(e))
     except FileNotFoundError:
@@ -1201,8 +1354,9 @@ async def artifact_download(request: Request):
     if public_url:
         return {"status": "success", "url": public_url,
                 "processed": final_path is None}
-    return FileResponse(str(final_path), media_type="video/mp4",
-                        filename=f"{safe_task}.mp4")
+    mime = "video/mp4" if kind == "video" else "image/png"
+    return FileResponse(str(final_path), media_type=mime,
+                        filename=f"{safe_task}.{mime.rsplit('/', 1)[1]}")
 
 
 # --------------------------------------------------------------------------
