@@ -1123,8 +1123,42 @@ _WM_POS_EXPR = {
 }
 
 
+def _delogo_rect(params, width: int, height: int, kind: str):
+    """Bottom-right rect where NotebookLM bakes its "Gemini Notebook"
+    logo. `delogo=1` uses the per-kind default; `delogo_rect=x:y:w:h`
+    (percent floats) overrides for layouts that put the mark elsewhere.
+    Returns (x,y,w,h) in px or None."""
+    raw = str(params.get("delogo_rect") or "").strip()
+    want = str(params.get("delogo") or "") in ("1", "true", "yes") or bool(raw)
+    if not want or width <= 0 or height <= 0:
+        return None
+    if raw:
+        try:
+            px, py, pw, ph = (float(v) for v in raw.split(":"))
+            rect = (round(width * px / 100), round(height * py / 100),
+                    round(width * pw / 100), round(height * ph / 100))
+        except (ValueError, TypeError):
+            rect = None
+    else:
+        rect = None
+    if rect is None:
+        # The "Gemini Notebook" badge sits in the extreme bottom-right
+        # corner (~last 10% of width, ~last 5% of height). Keep the rect
+        # tight so delogo never smears real content near the bottom edge.
+        rect = (round(width * 0.88), round(height * 0.94),
+                round(width * 0.12), round(height * 0.06))
+    # ffmpeg delogo refuses rects touching the frame edge (it needs
+    # surrounding pixels to interpolate) — clamp a 2px inner margin.
+    x, y, w, h = rect
+    x = min(max(1, x), width - 4)
+    y = min(max(1, y), height - 4)
+    w = min(w, width - x - 2)
+    h = min(h, height - y - 2)
+    return (x, y, w, h) if w > 0 and h > 0 else None
+
+
 async def _process_video(src: Path, safe_task: str, params) -> tuple:
-    """Trim + watermark via ffmpeg, optionally push to Cloudflare R2.
+    """Trim + delogo + watermark via ffmpeg, optionally push to R2.
     Returns (path_to_serve_or_None, public_url_or_None)."""
     trim_start = _fparam(params, "trim_start", 0, 600, 0)
     trim_end = _fparam(params, "trim_end", 0, 600, 0)
@@ -1136,10 +1170,12 @@ async def _process_video(src: Path, safe_task: str, params) -> tuple:
     wm_margin = int(_fparam(params, "wm_margin", 0, 200, 24))
     want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
 
-    needs_ffmpeg = bool(wm_url) or trim_start > 0 or trim_end > 0
     out = src
+    duration, width, height = await _probe_video(src)
+    delogo = _delogo_rect(params, width, height, "video")
+    needs_ffmpeg = bool(wm_url) or trim_start > 0 or trim_end > 0 \
+        or delogo is not None
     if needs_ffmpeg:
-        duration, width, _ = await _probe_video(src)
         keep = duration - trim_start - trim_end
         if duration > 0 and keep <= 0.5:
             raise _ProcessError(
@@ -1149,16 +1185,24 @@ async def _process_video(src: Path, safe_task: str, params) -> tuple:
         if trim_start > 0:
             argv += ["-ss", f"{trim_start:.2f}"]
         argv += ["-i", str(src)]
+        filters = []
+        base = "0:v"
+        if delogo is not None:
+            dx, dy, dw, dh = delogo
+            filters.append(f"[0:v]delogo=x={dx}:y={dy}:w={dw}:h={dh}[base]")
+            base = "base"
         if wm_url:
             wm = await _fetch_watermark(wm_url)
             argv += ["-i", str(wm)]
             wm_px = max(16, round(width * wm_pct / 100)) if width else 160
             x, y = _WM_POS_EXPR[wm_pos]
-            argv += [
-                "-filter_complex",
-                f"[1:v]scale={wm_px}:-2[wm];[0:v][wm]overlay="
-                f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]",
-                "-map", "[v]", "-map", "0:a?"]
+            filters.append(f"[1:v]scale={wm_px}:-2[wm];"
+                           f"[{base}][wm]overlay="
+                           f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]")
+        else:
+            filters.append(f"[{base}]null[v]")
+        argv += ["-filter_complex", ";".join(filters),
+                 "-map", "[v]", "-map", "0:a?"]
         # -t is an *output* option — it must sit after every -i, otherwise
         # it applies to the next input (the watermark image) and the real
         # video keeps its full tail.
@@ -1196,8 +1240,8 @@ def _csv_to_table(text: str) -> dict:
 
 
 async def _process_image(src: Path, safe_task: str, params) -> tuple:
-    """Watermark overlay on a still image (infographic PNG) + optional R2.
-    Same param surface as video minus trim; returns
+    """Delogo + watermark overlay on a still image (infographic PNG) +
+    optional R2. Same param surface as video minus trim; returns
     (path_to_serve_or_None, public_url_or_None)."""
     wm_url = (params.get("watermark") or "").strip()
     wm_pos = (params.get("wm_pos") or "br").lower()
@@ -1208,18 +1252,29 @@ async def _process_image(src: Path, safe_task: str, params) -> tuple:
     want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
 
     out = src
-    if wm_url:
-        _, width, _ = await _probe_video(src)
-        wm = await _fetch_watermark(wm_url)
-        wm_px = max(16, round(width * wm_pct / 100)) if width else 160
-        x, y = _WM_POS_EXPR[wm_pos]
+    _, width, height = await _probe_video(src)
+    delogo = _delogo_rect(params, width, height, "infographic")
+    if wm_url or delogo is not None:
+        filters = []
+        base = "0:v"
+        if delogo is not None:
+            dx, dy, dw, dh = delogo
+            filters.append(f"[0:v]delogo=x={dx}:y={dy}:w={dw}:h={dh}[base]")
+            base = "base"
+        argv = ["ffmpeg", "-y", "-i", str(src)]
+        if wm_url:
+            wm = await _fetch_watermark(wm_url)
+            argv += ["-i", str(wm)]
+            wm_px = max(16, round(width * wm_pct / 100)) if width else 160
+            x, y = _WM_POS_EXPR[wm_pos]
+            filters.append(f"[1:v]scale={wm_px}:-2[wm];"
+                           f"[{base}][wm]overlay="
+                           f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]")
+        else:
+            filters.append(f"[{base}]null[v]")
         out = src.with_name(f"{safe_task}.proc.png")
-        await _run_cmd(
-            "ffmpeg", "-y", "-i", str(src), "-i", str(wm),
-            "-filter_complex",
-            f"[1:v]scale={wm_px}:-2[wm];[0:v][wm]overlay="
-            f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]",
-            "-map", "[v]", "-frames:v", "1", str(out))
+        await _run_cmd(*argv, "-filter_complex", ";".join(filters),
+                       "-map", "[v]", "-frames:v", "1", str(out))
 
     if want_r2:
         url = await _upload_r2(out, safe_task, params,
