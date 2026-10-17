@@ -424,11 +424,18 @@ async def profiles(request: Request):
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     out = []
+    emails = {}
     if STORAGE_DIR.exists():
         for p in sorted(STORAGE_DIR.iterdir()):
             if (p / "storage_state.json").exists():
                 out.append(p.name)
-    return {"profiles": out}
+                ef = p / "email.txt"
+                if ef.is_file():
+                    try:
+                        emails[p.name] = ef.read_text().strip()
+                    except OSError:
+                        pass
+    return {"profiles": out, "emails": emails}
 
 
 @app.delete("/profiles/{profile}")
