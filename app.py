@@ -363,10 +363,15 @@ async def _check_auth(profile: str = "default", path=None) -> dict:
 
 def _to_storage_state(body) -> dict | None:
     """Accept: Playwright storage_state {cookies:[...]}, a bare cookie array
-    (Cookie-Editor export), or a raw 'k=v; k=v' Cookie header string."""
+    (Cookie-Editor export), a {"cookies": {name: value}} map, a single
+    {name,value} cookie object, or a raw 'k=v; k=v' Cookie header string."""
     cookies = None
     if isinstance(body, dict) and isinstance(body.get("cookies"), list):
         cookies = body["cookies"]
+    elif isinstance(body, dict) and isinstance(body.get("cookies"), dict):
+        cookies = [{"name": k, "value": v} for k, v in body["cookies"].items()]
+    elif isinstance(body, dict) and "name" in body and "value" in body:
+        cookies = [body]
     elif isinstance(body, list):
         cookies = body
     elif isinstance(body, str):
@@ -459,8 +464,13 @@ async def auth_upload(request: Request):
             payload = {"cookies": body["cookies"]}
     state = _to_storage_state(payload)
     if state is None:
+        shape = (f"list[{len(payload)}] with non-cookie entries" if isinstance(payload, list)
+                 else f"dict with keys {sorted(payload.keys())[:6]}" if isinstance(payload, dict)
+                 else f"string[{len(payload)}] with no 'k=v' pairs" if isinstance(payload, str)
+                 else type(payload).__name__)
         return _err(400, "bad_request",
-                    "expected storage_state {cookies:[...]}, a Cookie-Editor array, or a 'k=v; …' Cookie header")
+                    "expected storage_state {cookies:[...]}, a Cookie-Editor array, "
+                    f"or a 'k=v; …' Cookie header — got {shape}")
     path = _storage_path(profile)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
