@@ -458,10 +458,10 @@ async def auth_upload(request: Request):
         while _storage_path(f"p{n}").exists():
             n += 1
         profile = f"p{n}"
-        if "storage_state" in body:
-            payload = body["storage_state"]
-        elif isinstance(body.get("cookies"), list):
-            payload = {"cookies": body["cookies"]}
+    if isinstance(body, dict) and "storage_state" in body:
+        payload = body["storage_state"]
+    elif isinstance(body, dict) and isinstance(body.get("cookies"), list):
+        payload = {"cookies": body["cookies"]}
     state = _to_storage_state(payload)
     if state is None:
         shape = (f"list[{len(payload)}] with non-cookie entries" if isinstance(payload, list)
