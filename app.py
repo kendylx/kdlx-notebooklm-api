@@ -53,6 +53,7 @@ def _storage_path(profile: str) -> Path:
 
 app = FastAPI(title="nlm-bridge", version="0.1.0")
 _lock = asyncio.Lock()
+_auth_lock = asyncio.Lock()
 
 EXTRACT_PROMPT = """Bạn là bộ phân tích nghiên cứu. Dựa trên các nguồn trong notebook, trích xuất evidence cho chủ đề: "{keyword}".
 
@@ -407,7 +408,15 @@ async def status(request: Request):
     if MOCK:
         return {"authenticated": True, "email": "mock@example.test",
                 "profile": profile, "mock": True}
-    return await asyncio.wait_for(_check_auth(profile), timeout=30)
+    result = await asyncio.wait_for(_check_auth(profile), timeout=30)
+    # Tag the profile with its account email so a later cookie re-import of
+    # the same account can refresh this slot instead of squatting a new one.
+    if result.get("authenticated") and isinstance(result.get("email"), str) and result["email"]:
+        try:
+            _profile_email_path(profile).write_text(result["email"])
+        except OSError:
+            pass
+    return result
 
 
 @app.get("/profiles")
@@ -438,26 +447,51 @@ async def profile_delete(request: Request, profile: str):
     return {"profile": profile, "deleted": existed}
 
 
+def _next_free_profile() -> str:
+    n = 1
+    while _storage_path(f"p{n}").exists():
+        n += 1
+    return f"p{n}"
+
+
+def _profile_email_path(profile: str) -> Path:
+    return _storage_path(profile).parent / "email.txt"
+
+
+def _find_profile_by_email(email: str) -> str | None:
+    """Match a validated account email against stored profile tags."""
+    if not email or not STORAGE_DIR.exists():
+        return None
+    low = email.strip().lower()
+    for d in sorted(STORAGE_DIR.iterdir()):
+        f = d / "email.txt"
+        if f.is_file():
+            try:
+                if f.read_text().strip().lower() == low:
+                    return d.name
+            except OSError:
+                continue
+    return None
+
+
 @app.post("/auth")
 async def auth_upload(request: Request):
     """Accept login state from the user's own browser — no CLI needed:
     Playwright storage_state JSON, Cookie-Editor export, or a raw Cookie
-    header string. Saves per-profile and validates against the live API."""
+    header string. Validates against the live API BEFORE committing, then
+    resolves the target slot: an explicit `profile` wins; "auto" refreshes
+    an existing profile whose stored email matches, else takes the next
+    free pN. A rejected import leaves nothing behind."""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
     try:
         body = await request.json()
     except Exception:
         return _err(400, "bad_json", "body must be JSON")
-    profile = "default"
+    requested = "default"
     payload = body
     if isinstance(body, dict) and "profile" in body:
-        profile = str(body.get("profile") or "default")
-    if profile.lower() == "auto":
-        n = 1
-        while _storage_path(f"p{n}").exists():
-            n += 1
-        profile = f"p{n}"
+        requested = str(body.get("profile") or "default")
     if isinstance(body, dict) and "storage_state" in body:
         payload = body["storage_state"]
     elif isinstance(body, dict) and isinstance(body.get("cookies"), list):
@@ -471,18 +505,22 @@ async def auth_upload(request: Request):
         return _err(400, "bad_request",
                     "expected storage_state {cookies:[...]}, a Cookie-Editor array, "
                     f"or a 'k=v; …' Cookie header — got {shape}")
-    path = _storage_path(profile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
     if MOCK:
-        tmp.replace(path)
+        profile = _next_free_profile() if requested.lower() == "auto" else requested
+        path = _storage_path(profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+        (_profile_email_path(profile)).write_text("mock@example.test")
         return {"status": "success", "email": "mock@example.test",
                 "profile": profile, "mock": True}
-    # Validate BEFORE committing: a rejected import must neither squat an
-    # auto-slot (dead profile dir) nor overwrite a still-working session.
+    # Stage under a scratch dir so the library's sidecar writes stay contained
+    # and no existing session is touched until Google validates the cookies.
+    staging = STORAGE_DIR / ".incoming"
+    staging.mkdir(parents=True, exist_ok=True)
+    tmp = staging / "storage_state.json"
+    tmp.write_text(json.dumps(state))
     try:
-        result = await asyncio.wait_for(_check_auth(profile, tmp), timeout=30)
+        result = await asyncio.wait_for(_check_auth(requested, tmp), timeout=30)
     except asyncio.TimeoutError:
         tmp.unlink(missing_ok=True)
         return _err(504, "timeout", "validation timed out")
@@ -490,8 +528,22 @@ async def auth_upload(request: Request):
         tmp.unlink(missing_ok=True)
         return _err(400, "invalid_credentials",
                     str(result.get("reason", "unknown")))
-    tmp.replace(path)
-    return {"status": "success", "email": result.get("email"), "profile": profile}
+    email = result.get("email")
+    email = email if isinstance(email, str) else ""
+    async with _auth_lock:
+        profile = requested
+        if profile.lower() == "auto":
+            profile = _find_profile_by_email(email) or _next_free_profile()
+        path = _storage_path(profile)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.replace(path)
+        try:
+            staging.rmdir()
+        except OSError:
+            pass
+        if email:
+            _profile_email_path(profile).write_text(email)
+    return {"status": "success", "email": email or None, "profile": profile}
 
 
 @app.post("/research")
