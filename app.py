@@ -344,9 +344,10 @@ def _authed(request: Request) -> bool:
     return request.headers.get("authorization", "") == f"Bearer {BRIDGE_TOKEN}"
 
 
-async def _check_auth(profile: str = "default") -> dict:
+async def _check_auth(profile: str = "default", path=None) -> dict:
     """Validate saved credentials by hitting the real NotebookLM API."""
-    path = _storage_path(profile)
+    if path is None:
+        path = _storage_path(profile)
     if not path.exists():
         return {"authenticated": False, "reason": "no_credentials", "profile": profile}
     try:
@@ -416,6 +417,22 @@ async def profiles(request: Request):
     return {"profiles": out}
 
 
+@app.delete("/profiles/{profile}")
+async def profile_delete(request: Request, profile: str):
+    """Remove a stored profile — cleanup for rejected/expired sessions."""
+    if not _authed(request):
+        return _err(401, "unauthorized", "invalid bearer token")
+    path = _storage_path(profile)
+    existed = path.exists()
+    if existed:
+        path.unlink()
+    try:
+        path.parent.rmdir()  # only succeeds when no sidecars remain
+    except OSError:
+        pass
+    return {"profile": profile, "deleted": existed}
+
+
 @app.post("/auth")
 async def auth_upload(request: Request):
     """Accept login state from the user's own browser — no CLI needed:
@@ -448,17 +465,22 @@ async def auth_upload(request: Request):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
-    tmp.replace(path)
     if MOCK:
+        tmp.replace(path)
         return {"status": "success", "email": "mock@example.test",
                 "profile": profile, "mock": True}
+    # Validate BEFORE committing: a rejected import must neither squat an
+    # auto-slot (dead profile dir) nor overwrite a still-working session.
     try:
-        result = await asyncio.wait_for(_check_auth(profile), timeout=30)
+        result = await asyncio.wait_for(_check_auth(profile, tmp), timeout=30)
     except asyncio.TimeoutError:
+        tmp.unlink(missing_ok=True)
         return _err(504, "timeout", "validation timed out")
     if not result.get("authenticated"):
+        tmp.unlink(missing_ok=True)
         return _err(400, "invalid_credentials",
                     str(result.get("reason", "unknown")))
+    tmp.replace(path)
     return {"status": "success", "email": result.get("email"), "profile": profile}
 
 
