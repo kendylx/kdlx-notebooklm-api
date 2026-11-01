@@ -55,6 +55,18 @@ app = FastAPI(title="nlm-bridge", version="0.1.0")
 _lock = asyncio.Lock()
 _auth_lock = asyncio.Lock()
 
+# Per-profile locks: __Secure-1PSIDTS rotates server-side on a linear
+# lineage — two live clients on the SAME profile each mint a successor
+# from the same parent and Google revokes the SID silently (no security
+# email; "served a signed-out page" on next request). Every NotebookLM
+# client on a profile must hold that profile's lock; workers additionally
+# hold the global _lock to serialize RPC traffic across profiles.
+_profile_locks: dict = {}
+
+
+def _profile_lock(profile: str) -> asyncio.Lock:
+    return _profile_locks.setdefault(profile, asyncio.Lock())
+
 EXTRACT_PROMPT = """Bạn là bộ phân tích nghiên cứu. Dựa trên các nguồn trong notebook, trích xuất evidence cho chủ đề: "{keyword}".
 
 Chỉ trả về MỘT JSON object hợp lệ (không markdown, không giải thích) với đúng schema:
@@ -408,7 +420,21 @@ async def status(request: Request):
     if MOCK:
         return {"authenticated": True, "email": "mock@example.test",
                 "profile": profile, "mock": True}
-    result = await asyncio.wait_for(_check_auth(profile), timeout=30)
+    # Serialize with live work on the same profile — a concurrent status
+    # client would fork the cookie lineage (see _profile_locks). Bounded
+    # wait: never wedge a status poll behind a minutes-long research task,
+    # callers get "busy" instead of a stale or dead session verdict.
+    lock = _profile_lock(profile)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        return {"authenticated": None, "busy": True,
+                "reason": "job đang chạy trên profile này",
+                "profile": profile}
+    try:
+        result = await asyncio.wait_for(_check_auth(profile), timeout=30)
+    finally:
+        lock.release()
     # Tag the profile with its account email so a later cookie re-import of
     # the same account can refresh this slot instead of squatting a new one.
     if result.get("authenticated") and isinstance(result.get("email"), str) and result["email"]:
@@ -443,10 +469,21 @@ async def profile_delete(request: Request, profile: str):
     """Remove a stored profile — cleanup for rejected/expired sessions."""
     if not _authed(request):
         return _err(401, "unauthorized", "invalid bearer token")
-    path = _storage_path(profile)
-    existed = path.exists()
-    if existed:
-        path.unlink()
+    # Refuse to unlink a session mid-job — the worker's jar persist on
+    # close would resurrect a stale lineage under a fresh file.
+    lock = _profile_lock(profile)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        return _err(409, "profile_busy",
+                    "profile đang có job chạy — thử lại sau")
+    try:
+        path = _storage_path(profile)
+        existed = path.exists()
+        if existed:
+            path.unlink()
+    finally:
+        lock.release()
     try:
         path.parent.rmdir()  # only succeeds when no sidecars remain
     except OSError:
@@ -526,11 +563,23 @@ async def auth_upload(request: Request):
     staging.mkdir(parents=True, exist_ok=True)
     tmp = staging / "storage_state.json"
     tmp.write_text(json.dumps(state))
+    # Validation mints a fresh PSIDTS on the incoming cookies' lineage —
+    # if a worker is mid-flight on the same account that lineage forks and
+    # both sessions can be revoked. Serialize under the global work lock;
+    # uploads are rare so a bounded busy error beats session corruption.
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=20)
+    except asyncio.TimeoutError:
+        tmp.unlink(missing_ok=True)
+        return _err(503, "bridge_busy",
+                    "bridge đang chạy job — thử lại sau ~1 phút")
     try:
         result = await asyncio.wait_for(_check_auth(requested, tmp), timeout=30)
     except asyncio.TimeoutError:
         tmp.unlink(missing_ok=True)
         return _err(504, "timeout", "validation timed out")
+    finally:
+        _lock.release()
     if not result.get("authenticated"):
         tmp.unlink(missing_ok=True)
         return _err(400, "invalid_credentials",
@@ -541,15 +590,29 @@ async def auth_upload(request: Request):
         profile = requested
         if profile.lower() == "auto":
             profile = _find_profile_by_email(email) or _next_free_profile()
-        path = _storage_path(profile)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.replace(path)
+        # Commit must not interleave with a live worker on the same
+        # profile — the worker's persist-on-close would overwrite the
+        # fresh file with its stale lineage. Bounded wait keeps uploads
+        # from wedging behind a long job; retry wins over corruption.
+        plock = _profile_lock(profile)
         try:
-            staging.rmdir()
-        except OSError:
-            pass
-        if email:
-            _profile_email_path(profile).write_text(email)
+            await asyncio.wait_for(plock.acquire(), timeout=20)
+        except asyncio.TimeoutError:
+            tmp.unlink(missing_ok=True)
+            return _err(409, "profile_busy",
+                        f"profile {profile} đang có job chạy — thử lại sau")
+        try:
+            path = _storage_path(profile)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.replace(path)
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
+            if email:
+                _profile_email_path(profile).write_text(email)
+        finally:
+            plock.release()
     return {"status": "success", "email": email or None, "profile": profile}
 
 
@@ -587,7 +650,7 @@ async def research(request: Request):
         return {"status": "success", "profile": profile, "mode": mode,
                 "evidence_pack": pack}
 
-    async with _lock:
+    async with _lock, _profile_lock(profile):
         try:
             pack, gap_ok = await asyncio.wait_for(
                 _real_research(keyword, urls, profile, mode, timeout),
@@ -999,7 +1062,7 @@ async def artifact_start(request: Request):
         return {"tasks": tasks, "rejected": rejected,
                 "source_ids": scoped_ids}
 
-    async with _lock:
+    async with _lock, _profile_lock(profile):
         try:
             result = await asyncio.wait_for(_run(), timeout=timeout + 30)
         except asyncio.TimeoutError:
@@ -1060,7 +1123,7 @@ async def artifact_status(request: Request):
         return {"status": "completed", "artifact_id": task_id, "mock": True}
 
     from notebooklm import NotebookLMClient
-    async with _lock:
+    async with _lock, _profile_lock(profile):
         try:
             client = await NotebookLMClient.from_storage(_storage_path(profile))
             async with client:
@@ -1098,7 +1161,7 @@ async def artifact_cleanup(request: Request):
         return {"status": "success", "deleted": len(ids)}
 
     from notebooklm import NotebookLMClient
-    async with _lock:
+    async with _lock, _profile_lock(profile):
         try:
             client = await NotebookLMClient.from_storage(_storage_path(profile))
             async with client:
@@ -1446,7 +1509,7 @@ async def artifact_download(request: Request):
     from notebooklm import NotebookLMClient
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     safe_task = re.sub(r"[^A-Za-z0-9_-]", "", task_id) or "task"
-    async with _lock:
+    async with _lock, _profile_lock(profile):
         try:
             client = await NotebookLMClient.from_storage(_storage_path(profile))
             async with client:
