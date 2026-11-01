@@ -12,6 +12,7 @@ FastAPI bridge cho plugin `kdlx-ai-kontent` (repo anh em, thư mục `bridge/` =
 - `/artifact` nhận `title`+`content` (add_text), không chỉ permalink. kind CSV: `audio,quiz,video,infographic,datatable` + alias `both`/`all`. Download: audio=MP3 / video=MP4 / infographic=PNG binary hoặc `{"url":R2}` khi có process params (trim/watermark/delogo/r2); quiz=JSON; datatable=CSV→`{"table":…}`.
 - `/serp` → 9r `/v1/search`. Bearer `NLM_BRIDGE_TOKEN` mọi endpoint ngoài `/health` `/version`.
 - Media processing: ffmpeg `delogo` inpaint logo Gemini Notebook góc phải dưới (default `88:94:12:6` %, clamp margin 2px), trước watermark overlay; video `trim_start/end`; R2 creds chỉ trong env bridge.
+- **Lock contract (bắt buộc — sai là giết session)**: `__Secure-1PSIDTS` rotate theo chuỗi tuyến tính phía server — 2 client sống đồng thời trên 1 profile = lineage fork → Google revoke SID im lặng (KHÔNG security email; lỗi "served a signed-out page"). Mọi `NotebookLMClient.from_storage(profile)` phải nằm trong `_profile_lock(profile)`; worker nest thêm `_lock` global (order: `_lock` ngoài, profile trong — status/delete chỉ lấy profile lock nên không deadlock). `/status` + `/auth` validate + `/auth` commit + `DELETE /profiles` đều bounded-acquire (8–20s) trả `busy`/`profile_busy`/`bridge_busy` thay vì fork hoặc chờ hàng phút. `/status` busy → `{"authenticated": null, "busy": true}`.
 
 ## Nguyên tắc
 
