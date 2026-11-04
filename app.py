@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -665,6 +666,136 @@ async def research(request: Request):
     return {"status": "success", "profile": profile, "mode": mode,
             "asks": 2 if gap_ok else 1,
             "evidence_pack": pack}
+
+
+# --------------------------------------------------------------------------
+# Async research: POST /research/start -> task id, GET /research/status/{id}
+# -> poll. Deep research legitimately runs 20-40min server-side; a blocking
+# POST always outlives the caller's HTTP timeout, which leaves an orphaned
+# Google-side task and an empty evidence pack. The worker still holds _lock
+# + _profile_lock for its whole run, so multi-site serialization is unchanged.
+# --------------------------------------------------------------------------
+
+_RESEARCH_TASKS: dict = {}
+_RESEARCH_TASK_TTL = 3600.0   # keep finished results readable for 1h
+_RESEARCH_TASK_MAX = 64
+
+
+def _research_task_gc() -> None:
+    now = time.time()
+    for tid in [t for t, e in _RESEARCH_TASKS.items()
+                if e.get("done_at") and now - e["done_at"] > _RESEARCH_TASK_TTL]:
+        del _RESEARCH_TASKS[tid]
+    if len(_RESEARCH_TASKS) > _RESEARCH_TASK_MAX:
+        done = sorted(
+            (t, e["done_at"]) for t, e in _RESEARCH_TASKS.items() if e.get("done_at"))
+        for t, _ in done[:len(_RESEARCH_TASKS) - _RESEARCH_TASK_MAX]:
+            _RESEARCH_TASKS.pop(t, None)
+
+
+async def _research_worker(task_id: str, keyword: str, urls: list,
+                           profile: str, mode: str, timeout: int) -> None:
+    entry = _RESEARCH_TASKS[task_id]
+    try:
+        async with _lock, _profile_lock(profile):
+            entry["state"] = "running"
+            # Budget beyond the research-poll deadline: source ingestion can
+            # take up to MAX_URLS*120s and the two asks add ~300s. The sync
+            # endpoint's tight timeout+30 would clip a healthy deep run.
+            pack, gap_ok = await asyncio.wait_for(
+                _real_research(keyword, urls, profile, mode, timeout),
+                timeout=timeout + MAX_URLS * 120 + 300)
+        entry.update(status="completed", state="done", asks=2 if gap_ok else 1,
+                     evidence_pack=pack, done_at=time.time())
+    except asyncio.TimeoutError:
+        entry.update(status="failed", state="done", error="timeout",
+                     message="notebooklm research timed out", done_at=time.time())
+    except Exception as e:
+        entry.update(status="failed", state="done",
+                     error=type(e).__name__ or "upstream_error",
+                     message=_err_cause(e), done_at=time.time())
+
+
+def _research_parse_body(body) -> tuple | JSONResponse:
+    if not isinstance(body, dict):
+        return _err(400, "bad_json", "request body must be a JSON object")
+    keyword = body.get("keyword")
+    if not isinstance(keyword, str) or not keyword.strip():
+        return _err(400, "bad_request", "keyword is required")
+    urls = body.get("urls") or []
+    if not isinstance(urls, list):
+        return _err(400, "bad_request", "urls must be an array")
+    urls = [str(u) for u in urls if isinstance(u, str) and u.strip()][:MAX_URLS]
+    profile = str(body.get("profile") or "p1")
+    mode = body.get("mode") if body.get("mode") in ("fast", "deep") else "fast"
+    # Async tasks own the lock for their whole run — the 600s sync cap would
+    # defeat deep mode; 2700s still bounds a wedged task.
+    timeout = max(30, min(2700, int(body.get("timeout") or DEFAULT_TIMEOUT)))
+    return (keyword.strip(), urls, profile, mode, timeout)
+
+
+@app.post("/research/start")
+async def research_start(request: Request):
+    if not _authed(request):
+        return _err(401, "unauthorized", "invalid bearer token")
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "bad_json", "request body must be a JSON object")
+    parsed = _research_parse_body(body)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    keyword, urls, profile, mode, timeout = parsed
+    _research_task_gc()
+    task_id = uuid.uuid4().hex
+    if MOCK:
+        _RESEARCH_TASKS[task_id] = {
+            "status": "pending", "state": "running", "profile": profile,
+            "mode": mode, "keyword": keyword, "created_at": time.time(),
+            "done_at": None, "mock_polls": 0}
+        return {"status": "started", "task_id": task_id,
+                "profile": profile, "mode": mode}
+    _RESEARCH_TASKS[task_id] = {
+        "status": "pending", "state": "queued", "profile": profile,
+        "mode": mode, "keyword": keyword, "created_at": time.time(),
+        "done_at": None}
+    asyncio.create_task(
+        _research_worker(task_id, keyword, urls, profile, mode, timeout))
+    return {"status": "started", "task_id": task_id,
+            "profile": profile, "mode": mode}
+
+
+@app.get("/research/status/{task_id}")
+async def research_status(task_id: str, request: Request):
+    if not _authed(request):
+        return _err(401, "unauthorized", "invalid bearer token")
+    entry = _RESEARCH_TASKS.get(task_id)
+    if entry is None:
+        return _err(404, "not_found", "research task not found")
+    if MOCK:
+        entry["mock_polls"] = int(entry.get("mock_polls") or 0) + 1
+        if entry["mock_polls"] < 2:
+            return {"status": "pending", "state": "running"}
+        return {"status": "completed", "profile": entry["profile"],
+                "mode": entry["mode"], "asks": 2,
+                "evidence_pack": {
+                    "hard_numbers": [{"metric": "mock metric", "value": "42%"}],
+                    "claims": [{"claim": f"mock claim for {entry['keyword']}",
+                                "citations": [{"source_id": "mock://source-1"}]}],
+                    "conflicts": [], "knowledge_gaps": ["mock gap"],
+                    "consensus": [], "divergent": [], "echo_chamber": [],
+                    "entities": [], "actionable": {},
+                    "coverage_matrix": [], "unanswered_questions": [],
+                    "freshness": {}, "unique_to_source": [], "format_gaps": []}}
+    if entry["status"] == "completed":
+        return {"status": "completed", "profile": entry["profile"],
+                "mode": entry["mode"], "asks": entry.get("asks", 1),
+                "evidence_pack": entry.get("evidence_pack") or {}}
+    if entry["status"] == "failed":
+        return {"status": "failed", "error": entry.get("error") or "error",
+                "message": entry.get("message") or "research failed"}
+    return {"status": "pending", "state": entry.get("state") or "queued",
+            "elapsed_s": int(time.time() - entry["created_at"])}
 
 
 # --------------------------------------------------------------------------
