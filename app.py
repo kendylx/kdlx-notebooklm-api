@@ -351,7 +351,14 @@ async def version():
     except OSError:
         mtime = 0
     return {"app_mtime": mtime,
-            "build_sha": os.environ.get("NLM_BUILD_SHA", "")}
+            "build_sha": os.environ.get("NLM_BUILD_SHA", ""),
+            # Presence map only — lets the plugin's settings page report
+            # whether the bridge env can satisfy an R2 upload without ever
+            # exposing the credential values.
+            "r2_env": {k: bool(os.environ.get(k, "").strip()) for k in (
+                "NLM_R2_ACCOUNT_ID", "NLM_R2_ACCESS_KEY_ID",
+                "NLM_R2_SECRET_ACCESS_KEY", "NLM_R2_BUCKET",
+                "NLM_R2_PUBLIC_BASE")}}
 
 
 def _authed(request: Request) -> bool:
@@ -1465,6 +1472,7 @@ async def _process_video(src: Path, safe_task: str, params) -> tuple:
         wm_pos = "br"
     wm_pct = _fparam(params, "wm_width", 5, 40, 15)
     wm_margin = int(_fparam(params, "wm_margin", 0, 200, 24))
+    wm_opacity = _fparam(params, "wm_opacity", 10, 100, 100)
     want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
 
     out = src
@@ -1493,7 +1501,11 @@ async def _process_video(src: Path, safe_task: str, params) -> tuple:
             argv += ["-i", str(wm)]
             wm_px = max(16, round(width * wm_pct / 100)) if width else 160
             x, y = _WM_POS_EXPR[wm_pos]
-            filters.append(f"[1:v]scale={wm_px}:-2[wm];"
+            wm_chain = f"[1:v]scale={wm_px}:-2"
+            if wm_opacity < 100:
+                wm_chain += (f",format=rgba,colorchannelmixer="
+                             f"aa={wm_opacity / 100:.2f}")
+            filters.append(f"{wm_chain}[wm];"
                            f"[{base}][wm]overlay="
                            f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]")
         else:
@@ -1546,6 +1558,7 @@ async def _process_image(src: Path, safe_task: str, params) -> tuple:
         wm_pos = "br"
     wm_pct = _fparam(params, "wm_width", 5, 40, 15)
     wm_margin = int(_fparam(params, "wm_margin", 0, 200, 24))
+    wm_opacity = _fparam(params, "wm_opacity", 10, 100, 100)
     want_r2 = str(params.get("r2") or "") in ("1", "true", "yes")
 
     out = src
@@ -1564,7 +1577,11 @@ async def _process_image(src: Path, safe_task: str, params) -> tuple:
             argv += ["-i", str(wm)]
             wm_px = max(16, round(width * wm_pct / 100)) if width else 160
             x, y = _WM_POS_EXPR[wm_pos]
-            filters.append(f"[1:v]scale={wm_px}:-2[wm];"
+            wm_chain = f"[1:v]scale={wm_px}:-2"
+            if wm_opacity < 100:
+                wm_chain += (f",format=rgba,colorchannelmixer="
+                             f"aa={wm_opacity / 100:.2f}")
+            filters.append(f"{wm_chain}[wm];"
                            f"[{base}][wm]overlay="
                            f"{x.format(m=wm_margin)}:{y.format(m=wm_margin)}[v]")
         else:
@@ -1589,18 +1606,24 @@ async def _process_image(src: Path, safe_task: str, params) -> tuple:
 async def _upload_r2(path: Path, safe_task: str, params,
                      ext: str = "mp4",
                      content_type: str = "video/mp4") -> str:
-    """S3-compatible upload to Cloudflare R2. Credentials live in env on the
-    bridge; the plugin only sends bucket/prefix/public-base overrides."""
-    acct = os.environ.get("NLM_R2_ACCOUNT_ID", "").strip()
-    key_id = os.environ.get("NLM_R2_ACCESS_KEY_ID", "").strip()
-    secret = os.environ.get("NLM_R2_SECRET_ACCESS_KEY", "").strip()
+    """S3-compatible upload to Cloudflare R2. Credentials default to bridge
+    env (NLM_R2_*); the plugin may also pass r2_account_id /
+    r2_access_key_id / r2_secret_access_key params — e.g. when it reuses
+    the image-pipeline R2 settings — and params win over env, matching
+    the existing r2_bucket/r2_prefix/r2_public_base override contract."""
+    acct = (params.get("r2_account_id")
+            or os.environ.get("NLM_R2_ACCOUNT_ID") or "").strip()
+    key_id = (params.get("r2_access_key_id")
+              or os.environ.get("NLM_R2_ACCESS_KEY_ID") or "").strip()
+    secret = (params.get("r2_secret_access_key")
+              or os.environ.get("NLM_R2_SECRET_ACCESS_KEY") or "").strip()
     bucket = (params.get("r2_bucket") or os.environ.get("NLM_R2_BUCKET") or "").strip()
     public_base = (params.get("r2_public_base")
                    or os.environ.get("NLM_R2_PUBLIC_BASE") or "").strip().rstrip("/")
     if not (acct and key_id and secret and bucket and public_base):
         raise _ProcessError(
-            "R2 upload requested but NLM_R2_ACCOUNT_ID/ACCESS_KEY_ID/"
-            "SECRET_ACCESS_KEY/BUCKET/PUBLIC_BASE are not all set")
+            "R2 upload requested but account/key/secret/bucket/public_base "
+            "are not all set (r2_* params or NLM_R2_* env)")
     prefix = (params.get("r2_prefix")
               or os.environ.get("NLM_R2_PREFIX") or "").strip().strip("/")
     key = f"{prefix}/{safe_task}.{ext}" if prefix else f"{safe_task}.{ext}"
