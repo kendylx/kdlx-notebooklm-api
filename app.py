@@ -1149,10 +1149,13 @@ async def artifact_start(request: Request):
                         diff = d_map.get(
                             str(body.get("quiz_difficulty") or "medium").lower(),
                             QuizDifficulty.MEDIUM)
-                        # generate_quiz has no language param — language and
-                        # any custom style both travel through `instructions`.
-                        # Use the human language name when sent ("Vietnamese"
-                        # lands better in prompt text than the "vi" code).
+                        # Two language channels: the structured `language`
+                        # kwarg reaches the wire as language_code (needs
+                        # notebooklm-py pinned post-0.8.6, see requirements),
+                        # and a steering directive inside `instructions` as
+                        # belt-and-suspenders. Use the human language name
+                        # when sent ("Vietnamese" lands better in prompt
+                        # text than the "vi" code).
                         q_instructions = str(
                             body.get("quiz_instructions") or "").strip()[:4000]
                         if lang and not lang.lower().startswith("en"):
@@ -1160,10 +1163,19 @@ async def artifact_start(request: Request):
                                         f"explanation entirely in {lang_name}.")
                             q_instructions = (
                                 f"{lang_dir} {q_instructions}").strip()
-                        st = await client.artifacts.generate_quiz(
-                            nb_id, source_ids=src,
-                            instructions=q_instructions or None,
-                            quantity=qty, difficulty=diff)
+                        try:
+                            st = await client.artifacts.generate_quiz(
+                                nb_id, source_ids=src, language=lang,
+                                instructions=q_instructions or None,
+                                quantity=qty, difficulty=diff)
+                        except TypeError:
+                            # Lib older than the pin (stale image): no
+                            # `language` kwarg — steering text is the only
+                            # channel left.
+                            st = await client.artifacts.generate_quiz(
+                                nb_id, source_ids=src,
+                                instructions=q_instructions or None,
+                                quantity=qty, difficulty=diff)
                         _collect_task(tasks, rejected, "quiz", st)
                     except Exception as e:
                         rejected["quiz"] = f"{type(e).__name__}: {e}"
